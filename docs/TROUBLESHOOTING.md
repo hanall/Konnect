@@ -545,6 +545,10 @@ active layer belongs to the editor session, not the `.kicad_pcb` document.
 Close the board in KiCad, make a backup copy, remove only the injected
 `(active_layer "...")` line from the board file, and reopen the board. Do not
 remove the surrounding `(setup ...)` block. Konnect versions containing the
-fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
-the file byte-identical until stable KiCad IPC exposes a native operation with
-readback.
+original fix for #610 first refused this tool rather than write an invalid file
+token. Current versions use KiCad's typed native `GetActiveLayer` /
+`SetActiveLayer` / `GetActiveLayer` sequence against the exact open PCB and
+still leave the board file byte-identical. A delivered set whose response or
+readback is missing, or whose readback does not match, returns
+`ipc_outcome_unknown` with `retry_safe: false`; inspect the live PCB before
+deciding whether to retry.

@@ -80,7 +80,7 @@ and Windows servers do not.
 | `get_editor_selection` | Read the selection from one exact editor, project, document, and hierarchical sheet instance with stable KIID/UUID identities and document-readback freshness checks. |
 | `resolve_navigation_target` | Resolve an exact open project/document/sheet object by stable KIID, or by a human reference only when saved KiCad structure yields one unambiguous candidate. |
 | `mutate_editor_selection` | Clear, add to, or remove from one exact editor selection after saved-object validation; report success only when a fresh typed selection readback proves the complete requested set transition. |
-| `resolve_cross_probe_target` | Resolve an exact schematic-symbol/PCB-footprint destination in either direction from saved KiCad symbol-path linkage, while proving both explicit live document contexts and performing no activation or selection. |
+| `resolve_cross_probe_target` | Resolve an exact schematic-symbol/PCB-footprint destination in either direction from saved KiCad symbol-path linkage without activation or selection. Both live contexts are required by default; explicit `allow_saved_schematic_context: true` permits only a canonical same-stem root schematic as revision-bound `saved_file` authority while the PCB remains exact-live-bound. |
 
 ---
 
@@ -244,7 +244,7 @@ and Windows servers do not.
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
 | `get_board_stackup` | Read the physical stackup of the board KiCad holds open: each layer's type, thickness and material, dielectric εr and loss tangent, the copper finish, impedance control, edge settings, and the board thickness KiCad computes from the stack. `findings` lists unspecified fabrication values and, given `expected`, every value that differs from it. Live only and read-only; changes are made in Board Setup. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
-| `set_active_layer` | Return `unsupported_capability` without writing: active layer is editor-session state and the bundled stable KiCad IPC protocol exposes no supported mutation/readback. |
+| `set_active_layer` | Change the exact open PCB's editor-session layer through typed native IPC and report success only after `GetActiveLayer` readback matches. It never writes the board file; a delivered set with missing or mismatching readback returns `ipc_outcome_unknown` and is not retry-safe. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
