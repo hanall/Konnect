@@ -765,11 +765,19 @@ mod reload_tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn an_open_executable_handle_can_be_invoked_after_its_path_is_irrelevant() {
-        let directory = tempfile::tempdir().unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let directory = tempfile::tempdir_in(test_binary.parent().unwrap()).unwrap();
         let copied_path = directory.path().join("reload-candidate");
-        std::fs::copy(std::env::current_exe().unwrap(), &copied_path).unwrap();
+        // 병렬 spawn이 새 복사본의 쓰기 핸들을 잠시 상속하는 ETXTBSY 경합을 피한다.
+        // 같은 파일시스템의 이미 실행 중인 불변 inode를 별도 이름으로 참조한다.
+        std::fs::hard_link(&test_binary, &copied_path).unwrap();
         let executable = File::open(&copied_path).unwrap();
         std::fs::remove_file(&copied_path).unwrap();
+        let removed_path_error = std::process::Command::new(&copied_path)
+            .arg("--list")
+            .output()
+            .expect_err("삭제된 후보 경로를 실행하면 반드시 실패해야 한다");
+        assert_eq!(removed_path_error.kind(), std::io::ErrorKind::NotFound);
         let output = std::process::Command::new(executable_handle_path(&executable))
             .arg("--list")
             .output()
