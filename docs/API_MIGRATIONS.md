@@ -3,6 +3,96 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: active-layer IPC and explicit saved-root cross-probe context (minor release)
+
+`set_active_layer` is no longer an unconditional unsupported-capability
+response. It resolves the exact open PCB, reads its current layer with KiCad's
+typed `GetActiveLayer`, sends typed `SetActiveLayer`, and performs a second
+`GetActiveLayer` before reporting success. All three requests carry the exact
+`DocumentSpecifier` returned by `GetOpenDocuments`. The operation changes
+editor-session state only; it does not write the board file.
+
+A delivered set whose response or readback cannot prove the final layer, and a
+readback that differs from the requested layer, return
+`ipc_outcome_unknown` with `board_state: "unknown"` and `retry_safe: false`.
+Clients must inspect the live PCB before deciding whether to retry. An explicit
+KiCad rejection remains an error and is not converted into a saved-file
+fallback.
+
+`resolve_cross_probe_target` adds the optional boolean
+`allow_saved_schematic_context`, defaulting to `false`. The default contract is
+unchanged and still requires exact live PCB and schematic document identities.
+When the flag is explicitly `true`, the resolve-only tool may handle KiCad
+manager endpoints that expose the open root schematic only as an unbound
+`BoardFilename`. This mode is limited to canonical same-stem root
+`.kicad_pro`/`.kicad_sch`/`.kicad_pcb` siblings, one unambiguous schematic
+basename, an exact live PCB, and a root sheet KIID matching the saved
+schematic. Hierarchy, ambiguity, project mismatch, or saved-file revision drift
+is refused.
+
+The opt-in response labels schematic authority as `saved_file`, sets
+`live_schematic_exact: false`, leaves that schematic's live document field
+null, and includes the before/after SHA-256 binding for both saved documents.
+It never activates an editor, selects an object, or authorizes a later mutation
+to treat the saved schematic as proven live.
+
+## Unreleased: symbol search reads KiCad 10 `.kicad_symdir` libraries (patch release)
+
+`register_symbol_library` and `list_symbols_in_library` now accept either a
+legacy single `.kicad_sym` file or KiCad 10's `.kicad_symdir` directory. The
+directory is enumerated in stable order and each contained `.kicad_sym` is
+parsed structurally; a matching entry that is not a readable regular file is
+reported instead of silently omitted.
+
+`search_symbols` uses the same reader, so a project table entry such as
+`Connector_Generic.kicad_symdir` is searchable. Project entries precede and
+shadow a global entry with the same nickname, and duplicate result IDs are
+returned once. `limit: 0` now returns no results rather than leaking the first
+match. A present but unreadable project/global table or registered library is
+an error rather than an indistinguishable zero-result success.
+
+Search still follows registered `sym-lib-table` entries. The conventional
+installed-library fallback remains available to exact `Library:Symbol`
+resolution and placement, but an unregistered installed directory is not
+implicitly added to a broad search; register it at project or isolated global
+scope when it must be searched.
+
+## Unreleased: `move_connected` restores its connected move contract (minor release)
+
+`move_connected` again accepts `schematic`, `reference`, `x` and `y`. The tool
+had exposed an empty argument object and refused every call after its earlier
+implementation was found to move only the symbol while falsely reporting that
+connections were preserved (#315).
+
+The restored operation moves all placed units of the selected reference by one
+shared, grid-snapped delta. It does not translate an existing wire or a remote
+pin. Instead it leaves every existing wire UUID and endpoint fixed and adds the
+minimum one- or two-segment orthogonal bridge from each moved pin back to a
+proven fixed attachment. A label placed directly on a moved pin and its
+no-connect marker move with that pin; unrelated labels and every existing
+junction remain fixed.
+
+Success now requires three independent checks before the write: the normalized
+pin/label connectivity partition and every net alias must be unchanged, all
+existing remote geometry must be unchanged, and KiCad CLI's exported netlist
+must be identical. Both possible orthogonal elbows are tried. If neither is
+safe, the call refuses without changing the schematic. The same graph,
+geometry and KiCad-netlist checks are repeated from the committed file; an
+unreadable or divergent readback is reported as an uncertain mutation outcome.
+
+The stricter proof has deliberate requirements. `kicad-cli` must be configured
+and executable; every placed symbol's pin geometry must resolve; and existing
+wires, labels, junctions, and no-connect markers that participate in the proof
+must carry unambiguous UUIDs. The tool tries the two Manhattan elbows but does
+not perform obstacle-avoiding schematic layout. A route that would join another
+pin or named net is refused rather than guessed, even when a human could draw a
+longer safe detour. These refusals leave the source bytes unchanged.
+
+This is a compatible restoration of the four arguments documented as
+temporarily removed below. Callers that treated unconditional refusal as the
+only outcome can now send the original request shape and receive a verified
+move result including bridge, label and no-connect counts.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
@@ -112,21 +202,48 @@ writes. `bulk_move_schematic_components` used to write a symbol at
 `added_wire` echo is rounded the same way. The values differ by less than
 1e-12 mm; nothing else in the request or response changes (#744).
 
-## Unreleased: `open_schematic_viewer` reports a viewer that exits during startup (patch release)
+## Unreleased: `open_schematic_viewer`가 browser readiness를 검증함 (patch release)
 
-`open_schematic_viewer` used to return `launched: true` as soon as the viewer
-process spawned, even when it crashed straight away, for example on Linux with
-no `DISPLAY` or `WAYLAND_DISPLAY`. It now watches the viewer for one second. If
-the viewer exits in that time, the call is an error whose message gives the exit
-status and the last 20 lines of the viewer's stderr, each cut to 500
-characters. A viewer that is still running after that second gets the same
-successful response as before. Every successful call now takes about one second
-longer, and on the stdio transport no other request is answered during it.
+이전 `open_schematic_viewer`는 viewer process가 spawn되거나 잠시 살아 있다는
+이유만으로 `launched: true`를 반환했습니다. 따라서 display·WebView 초기화 실패,
+즉시 crash, browser 미연결을 성공으로 잘못 보고할 수 있었습니다(#702).
 
-The viewer no longer inherits the server's stdin and stdout, which carry the
-stdio transport's JSON-RPC stream. Its stderr is read by the server and written
-to the server log as `schematic_viewer` warnings, so that output now stops when
-the server exits (#702).
+viewer는 이제 Tauri/WebView process가 아니라 `127.0.0.1`의 OS 할당 random
+port에서 동작하는 capability-token browser server입니다. Root schematic과 같은
+project directory 안의 hierarchy를 검증하고 격리된 임시 snapshot에서 root SVG를
+render한 뒤 watcher를 시작합니다. 그다음 시스템 browser가 capability URL의
+page와 state, SVG를 받고 SVG의 `img.onload`가 발생한 뒤 same-origin readiness
+POST를 보낸 경우에만 stderr로 readiness record를 발행합니다.
+
+MCP server는 최대 60초 동안 이 record와 실제 child PID를 대조합니다. 다음 중
+하나라도 발생하면 child를 종료·회수하고 tool error를 반환합니다.
+
+- child가 readiness 전에 종료하거나 diagnostic pipe를 닫음
+- readiness JSON, PID, loopback URL 또는 256-bit capability 형식이 잘못됨
+- browser load, root render, watcher 또는 `isolated_snapshot` evidence가 빠짐
+- readiness timeout
+
+성공 response에는 기존 `launched: true`와 함께 `ready: true`, capability `url`,
+`viewer_pid`, `health`가 포함됩니다. `health`는 bind 주소, browser/root/watcher
+상태, source, 전체·rendered sheet 수, render error·warning 수를 공개합니다.
+Capability URL은 local access credential이므로 필요 이상 공유하거나 장기 보관하지
+않아야 합니다. stdio transport에서는 readiness를 기다리는 동안 같은 server가
+다른 request에 답하지 않습니다.
+
+Browser가 연결된 뒤 인증된 request가 120초 동안 없으면 viewer는 종료됩니다.
+여러 viewer process는 각각 OS가 할당한 port, 독립 token, render cache와 watcher를
+사용하므로 서로의 design state를 공유하지 않습니다.
+
+Viewer child는 server의 JSON-RPC stdin/stdout을 상속하지 않습니다. stderr는
+`schematic_viewer` log로 전달하되 startup failure response에는 마지막 20줄만,
+각 줄 최대 500자까지 포함합니다. Readiness 뒤에는 별도 waiter가 child 종료를
+회수합니다.
+
+`kicad_cli = "kicad-cli"` 같은 bare name은 shell을 거치지 않습니다. 빈·상대
+PATH entry를 무시하고 absolute PATH directory에서 exact filename을 찾은 다음
+canonical absolute regular executable로 검증합니다. 기본 `kicad-cli`가 PATH에
+없으면 platform별 공식 설치 후보를 검사합니다. 절대경로와 `./` 또는 directory가
+포함된 명시 상대경로는 PATH fallback 없이 지정된 의미 그대로 검증합니다.
 
 ## Unreleased: `get_board_extents` reads the live board and measures every item (minor release)
 
@@ -2123,7 +2240,7 @@ identical without it.
 | `export_manufacturing_package.quantity` | Omit it from export. Manufacturing files are quantity-independent; pass `quantity` to `estimate_cost` for pricing context. |
 | `validate_for_manufacturing.schematic` | Run the board validator without it. Use `check_bom_health(schematic)` for the separate schematic/BOM review. |
 | `estimate_cost.schematic` | Omit it. The estimator counts placed board footprints, which are the components relevant to assembly pricing. |
-| `move_connected.*` (all parameters) | The tool now refuses unconditionally: it never implemented the connected move and silently delegated to a plain symbol move while reporting connections preserved (#315). Use `move_schematic_component`, then re-route the affected nets. The parameters return when the wire-carrying move is actually built. |
+| `move_connected.*` (all parameters) | These parameters were removed while the tool refused unconditionally because its original handler only performed a plain move (#315). They are restored by "`move_connected` restores its connected move contract" above; current clients should again pass `schematic`, `reference`, `x`, and `y`. |
 
 These removals narrow the schema to behavior Konnect can verify. They do not change
 the generated files or analysis because the removed values had no implementation.

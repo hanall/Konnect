@@ -296,12 +296,29 @@ fn sanitize_version_line(line: &str) -> Option<String> {
 
 fn stable_version_cmp(candidate: &str, running: &str) -> Option<Ordering> {
     fn stable_triplet(version: &str) -> Option<[u64; 3]> {
-        if version.contains(['-', '+']) {
+        let precedence = match version.split_once('+') {
+            Some((precedence, build)) => {
+                if build.is_empty()
+                    || build.contains('+')
+                    || build.split('.').any(|identifier| {
+                        identifier.is_empty()
+                            || !identifier
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+                {
+                    return None;
+                }
+                precedence
+            }
+            None => version,
+        };
+        if precedence.contains('-') {
             return None;
         }
-        let values = version
+        let values = precedence
             .strip_prefix('v')
-            .unwrap_or(version)
+            .unwrap_or(precedence)
             .split('.')
             .map(str::parse::<u64>)
             .collect::<Result<Vec<_>, _>>()
@@ -450,6 +467,36 @@ mod tests {
         );
         assert_eq!(stable_version_cmp("0.11.0-beta.1", "0.10.0"), None);
         assert_eq!(stable_version_cmp("not-a-version", "0.11.0"), None);
+    }
+
+    #[test]
+    fn stable_version_comparison_ignores_only_valid_build_metadata() {
+        assert_eq!(
+            stable_version_cmp("0.13.0+hanall.1", "0.13.0+hanall.2"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            stable_version_cmp("v0.13.1+build-7.sha", "0.13.0+hanall.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            stable_version_cmp("0.12.9+backport", "0.13.0+hanall.1"),
+            Some(Ordering::Less)
+        );
+        for invalid in [
+            "0.13.0+",
+            "0.13.0+hanall..1",
+            "0.13.0+hanall.",
+            "0.13.0++hanall",
+            "0.13.0+hanall_1",
+            "0.13.0-beta.1+hanall.1",
+        ] {
+            assert_eq!(
+                stable_version_cmp(invalid, "0.13.0+hanall.1"),
+                None,
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -298,11 +298,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "list_symbols_in_library",
-            "List all symbol names defined in a .kicad_sym library file.",
+            "List all symbol names defined in a .kicad_sym library file or KiCad 10 .kicad_symdir directory.",
             json!({
                 "type": "object",
                 "properties": {
-                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "library_path": { "type": "string", "description": "Path to a .kicad_sym library file or .kicad_symdir directory" },
                     "limit": { "type": "integer", "description": "Maximum number of symbols to return", "default": 100 }
                 },
                 "required": ["library_path"]
@@ -311,13 +311,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "register_symbol_library",
-            "Register a .kicad_sym library file in the KiCAD global or project symbol table. \
+            "Register a .kicad_sym library file or KiCad 10 .kicad_symdir directory in the KiCAD global or project symbol table. \
              Reports whether the entry was inserted, left unchanged, or updated — an existing \
              nickname is kept as-is unless replace_existing is set.",
             json!({
                 "type": "object",
                 "properties": {
-                    "library_path": { "type": "string", "description": "Path to .kicad_sym file" },
+                    "library_path": { "type": "string", "description": "Path to a .kicad_sym file or .kicad_symdir directory" },
                     "nickname": { "type": "string", "description": "Library nickname" },
                     "scope": {
                         "type": "string",
@@ -1478,14 +1478,35 @@ impl KiCadSymbolSource {
     /// Project entries first so they shadow same-nickname global ones.
     fn tables(&self) -> &[serde_json::Value] {
         self.tables.get_or_init(|| {
-            let mut libs = Vec::new();
-            if let Some(dir) = &self.project_dir {
-                libs.extend(read_flat_lib_table(&dir.join("sym-lib-table")));
-            }
-            libs.extend(read_flat_lib_table(&global_sym_lib_table()));
-            libs
+            let project = self
+                .project_dir
+                .as_ref()
+                .map(|dir| read_flat_lib_table(&dir.join("sym-lib-table")))
+                .unwrap_or_default();
+            merge_symbol_lib_tables(project, read_flat_lib_table(&global_sym_lib_table()))
         })
     }
+}
+
+/// 프로젝트 테이블을 먼저 유지하고 같은 nickname의 전역 항목은 제거한다.
+///
+/// KiCad의 두 테이블은 단순 연결 목록이 아니다. 프로젝트가 같은 nickname을
+/// 선언하면 그 항목 전체가 전역 항목을 가린다. 이 병합을 검색과 심볼 배치가
+/// 함께 사용해야 두 공개 경계가 서로 다른 파일을 고르는 일을 막을 수 있다.
+fn merge_symbol_lib_tables(
+    project: Vec<serde_json::Value>,
+    global: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    project
+        .into_iter()
+        .chain(global)
+        .filter(|lib| {
+            lib["nickname"]
+                .as_str()
+                .is_some_and(|nickname| !nickname.is_empty() && seen.insert(nickname.to_string()))
+        })
+        .collect()
 }
 
 impl konnect_schematic_editor::library::SymbolLibrarySource for KiCadSymbolSource {
@@ -4623,6 +4644,92 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+/// 단일 파일과 KiCad 10의 심볼별 디렉터리를 같은 라이브러리 경계로 읽는다.
+///
+/// 디렉터리 안의 `.kicad_sym` 항목이 일반 파일이 아니면 손상된 라이브러리로
+/// 보고한다. 이를 건너뛰면 검색 결과 0건이 정상적인 불일치인지 읽기 실패인지
+/// 사용자가 구분할 수 없다.
+async fn symbol_library_files(lib_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let metadata = tokio::fs::metadata(lib_path).await.map_err(|error| {
+        format!(
+            "Symbol library path does not exist or is not readable: {}: {}",
+            lib_path.display(),
+            error
+        )
+    })?;
+    if metadata.is_file() {
+        return Ok(vec![lib_path.to_path_buf()]);
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Symbol library path does not exist or is not readable: {}",
+            lib_path.display()
+        ));
+    }
+
+    let mut entries = tokio::fs::read_dir(lib_path).await.map_err(|error| {
+        format!(
+            "Cannot read symbol library directory {}: {}",
+            lib_path.display(),
+            error
+        )
+    })?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|error| {
+        format!(
+            "Cannot read an entry in symbol library directory {}: {}",
+            lib_path.display(),
+            error
+        )
+    })? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("kicad_sym") {
+            continue;
+        }
+        let entry_metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+            format!(
+                "Cannot inspect symbol library entry {}: {}",
+                path.display(),
+                error
+            )
+        })?;
+        if !entry_metadata.is_file() {
+            return Err(format!(
+                "Symbol library entry is not a readable file: {}",
+                path.display()
+            ));
+        }
+        files.push(path);
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// 한 라이브러리 경로의 모든 최상위 심볼 이름을 정렬·중복 제거해 읽는다.
+async fn symbol_names_in_library_path(lib_path: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for file in symbol_library_files(lib_path).await? {
+        let content = tokio::fs::read_to_string(&file).await.map_err(|error| {
+            format!(
+                "Cannot read symbol library file {}: {}",
+                file.display(),
+                error
+            )
+        })?;
+        let mut file_names = top_level_symbol_names(&content).map_err(|error| {
+            format!(
+                "Cannot parse symbol library file {}: {}",
+                file.display(),
+                error
+            )
+        })?;
+        names.append(&mut file_names);
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 /// The `.kicad_sym` file defining `nick:sym_name`, found exactly the way symbol
 /// placement finds it — via [`KiCadSymbolSource`], so a lookup here and a
 /// placement of the same lib_id can never disagree.
@@ -4704,10 +4811,11 @@ fn resolve_symbol_pins<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> Vec<&'
 
 /// Search one library body for top-level symbols whose name contains `query`
 /// (case-insensitive), returning result objects shaped like `search_symbols`.
-fn search_lib_symbols(nickname: &str, content: &str, query: &str) -> Vec<serde_json::Value> {
-    let Ok(names) = top_level_symbol_names(content) else {
-        return Vec::new();
-    };
+fn search_lib_symbols(
+    nickname: &str,
+    names: impl IntoIterator<Item = String>,
+    query: &str,
+) -> Vec<serde_json::Value> {
     names
         .into_iter()
         .filter(|n| n.to_lowercase().contains(query))
@@ -4726,9 +4834,10 @@ async fn handle_list_symbols_in_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let content = tokio::fs::read_to_string(&lib_path).await?;
-
-    let symbols = top_level_symbol_names(&content)?;
+    let symbols = match symbol_names_in_library_path(&lib_path).await {
+        Ok(symbols) => symbols,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
     let limit = args["limit"].as_u64().unwrap_or(100) as usize;
     let truncated = symbols.len() > limit;
 
@@ -4753,41 +4862,66 @@ async fn handle_search_symbols(
     };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
+    // 0은 "무제한"이 아니라 공개 schema 그대로 결과 상한 0이다. 첫 결과를
+    // push한 뒤 길이를 비교하면 한 건이 누출되므로 어떤 파일도 읽기 전에 끝낸다.
+    if limit == 0 {
+        return Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "query": query,
+                "count": 0,
+                "results": []
+            }))
+            .unwrap(),
+        ));
+    }
+
     let project_dir = args["project_dir"]
         .as_str()
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    // Gather (nickname, path) entries from the global sym-lib-table and, when a
-    // project dir is supplied, the project's own sym-lib-table too — this is
-    // what makes project-attached libraries searchable. Nested `(type "Table")`
-    // references are followed and `${KICAD*_DIR}` URIs expanded, so the
-    // libraries KiCad ships are included.
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = &project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in &tables {
-        for lib in read_flat_lib_table(table) {
-            if let (Some(nick), Some(path)) = (lib["nickname"].as_str(), lib["path"].as_str()) {
-                entries.push((nick.to_string(), path.to_string()));
-            }
+    // 프로젝트 항목이 같은 nickname의 전역 항목을 가리는 KiCad 우선순위를
+    // 심볼 배치와 동일하게 적용한다. 테이블이나 라이브러리 읽기 실패는 0건으로
+    // 축약하지 않고 공개 도구 오류로 돌려 검색의 완전성을 보존한다.
+    let project_entries = if let Some(pd) = &project_dir {
+        match read_lib_table_checked(&pd.join("sym-lib-table")) {
+            Ok(entries) => entries,
+            Err(message) => return Ok(CallToolResult::error(message)),
         }
-    }
+    } else {
+        Vec::new()
+    };
+    let global_entries = match read_lib_table_checked(&global_sym_lib_table()) {
+        Ok(entries) => entries,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    let entries = merge_symbol_lib_tables(project_entries, global_entries);
 
     let mut results = Vec::new();
-    // `entries` holds resolved filesystem paths, not the raw uris they came
-    // from — read_flat_lib_table does that expansion now.
-    'outer: for (nickname, resolved) in entries {
-        let lib_path = PathBuf::from(&resolved);
-        if !lib_path.exists() {
-            continue;
-        }
-        let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
-            continue;
+    let mut seen_ids = std::collections::HashSet::new();
+    'outer: for entry in entries {
+        let Some(nickname) = entry["nickname"].as_str() else {
+            return Ok(CallToolResult::error(
+                "Symbol library table entry has no nickname",
+            ));
         };
-        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
+        let Some(resolved) = entry["path"].as_str() else {
+            return Ok(CallToolResult::error(format!(
+                "Symbol library '{}' has an unresolvable URI '{}'",
+                nickname,
+                entry["uri"].as_str().unwrap_or("")
+            )));
+        };
+        let lib_path = PathBuf::from(resolved);
+        let names = match symbol_names_in_library_path(&lib_path).await {
+            Ok(names) => names,
+            Err(message) => return Ok(CallToolResult::error(message)),
+        };
+        for hit in search_lib_symbols(nickname, names, &query) {
+            let id = hit["id"].as_str().unwrap_or_default().to_string();
+            if !seen_ids.insert(id) {
+                continue;
+            }
             results.push(hit);
             if results.len() >= limit {
                 break 'outer;
@@ -8428,7 +8562,8 @@ mod tests {
             "\t(symbol \"LED\"\r\n\t\t(symbol \"LED_0_1\")\r\n\t)\r\n",
             ")\r\n",
         );
-        let results = search_lib_symbols("projlib", body, "foo");
+        let names = top_level_symbol_names(body).unwrap();
+        let results = search_lib_symbols("projlib", names, "foo");
         let names: Vec<&str> = results
             .iter()
             .map(|r| r["name"].as_str().unwrap_or(""))
@@ -8440,6 +8575,235 @@ mod tests {
             !names.iter().any(|n| n.ends_with("_0_1")),
             "sub-units leaked: {names:?}"
         );
+    }
+
+    /// 실제 공개 핸들러가 KiCad 10의 심볼별 디렉터리 형식을 읽고,
+    /// `limit: 0`을 결과 한 건으로 잘못 해석하지 않아야 한다.
+    #[tokio::test]
+    async fn list_symbols_reads_symdir_and_honors_zero_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symdir = tmp.path().join("Connector_Generic.kicad_symdir");
+        std::fs::create_dir(&symdir).unwrap();
+        std::fs::write(
+            symdir.join("Conn_01x02.kicad_sym"),
+            "(kicad_symbol_lib (symbol \"Conn_01x02\" (symbol \"Conn_01x02_1_1\")))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            symdir.join("Conn_01x03.kicad_sym"),
+            "(kicad_symbol_lib (symbol \"Conn_01x03\" (symbol \"Conn_01x03_1_1\")))\n",
+        )
+        .unwrap();
+
+        let args = json!({
+            "library_path": symdir.to_string_lossy(),
+            "limit": 0,
+        });
+        let res = handle_list_symbols_in_library(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(
+            out["count"], 2,
+            "디렉터리의 전체 심볼 수가 보존되어야 함: {out}"
+        );
+        assert_eq!(
+            out["symbols"],
+            json!([]),
+            "limit=0은 결과를 반환하면 안 됨: {out}"
+        );
+        assert_eq!(
+            out["truncated"], true,
+            "숨겨진 결과가 있음을 밝혀야 함: {out}"
+        );
+    }
+
+    /// 프로젝트 테이블에 등록된 `.kicad_symdir`와 기존 단일 파일을
+    /// 동일한 공개 검색 경계에서 함께 찾을 수 있어야 한다.
+    #[tokio::test]
+    async fn search_symbols_reads_registered_symdir_and_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symdir = tmp.path().join("Split.kicad_symdir");
+        std::fs::create_dir(&symdir).unwrap();
+        std::fs::write(
+            symdir.join("ProbeSplit.kicad_sym"),
+            "(kicad_symbol_lib (symbol \"ProbeSplit\"))\n",
+        )
+        .unwrap();
+        let single = tmp.path().join("Single.kicad_sym");
+        std::fs::write(&single, "(kicad_symbol_lib (symbol \"ProbeSingle\"))\n").unwrap();
+        std::fs::write(
+            tmp.path().join("sym-lib-table"),
+            kicad_style_table(
+                "sym_lib_table",
+                &[
+                    ("Split", "KiCad", &symdir.to_string_lossy()),
+                    ("Single", "KiCad", &single.to_string_lossy()),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "query": "Probe",
+            "project_dir": tmp.path().to_string_lossy(),
+        });
+        let res = handle_search_symbols(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        let ids: Vec<&str> = out["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|result| result["id"].as_str())
+            .collect();
+        assert_eq!(out["count"], 2, "두 저장 형식을 모두 검색해야 함: {out}");
+        assert!(ids.contains(&"Split:ProbeSplit"), "symdir 결과 누락: {out}");
+        assert!(
+            ids.contains(&"Single:ProbeSingle"),
+            "단일 파일 결과 누락: {out}"
+        );
+    }
+
+    /// await나 process-wide 환경변수 없이 테이블 병합의 KiCad 우선순위를
+    /// 직접 고정한다. 같은 nickname은 프로젝트 항목 하나만 남아야 한다.
+    #[test]
+    fn project_symbol_table_entry_shadows_global_entry() {
+        let project = vec![json!({"nickname": "SharedNick", "path": "/project/lib"})];
+        let global = vec![json!({"nickname": "SharedNick", "path": "/global/lib"})];
+        let merged = merge_symbol_lib_tables(project, global);
+        assert_eq!(merged.len(), 1, "동일 nickname이 중복됨: {merged:?}");
+        assert_eq!(
+            merged[0]["path"], "/project/lib",
+            "프로젝트 항목이 우선해야 함"
+        );
+    }
+
+    /// 같은 nickname의 중복 프로젝트 항목은 먼저 등록된 라이브러리만
+    /// 검색하며, 같은 심볼이 여러 파일에 있어도 공개 결과 ID는 한 번만 나온다.
+    #[tokio::test]
+    async fn search_symbols_project_entry_is_first_and_deduplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let symdir = project.join("SharedNick.kicad_symdir");
+        std::fs::create_dir(&symdir).unwrap();
+        let project_body = "(kicad_symbol_lib (symbol \"PriorityProjectOnly\"))\n";
+        std::fs::write(symdir.join("one.kicad_sym"), project_body).unwrap();
+        std::fs::write(symdir.join("two.kicad_sym"), project_body).unwrap();
+        let later = project.join("Later.kicad_sym");
+        std::fs::write(
+            &later,
+            "(kicad_symbol_lib (symbol \"PriorityLaterDuplicate\"))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("sym-lib-table"),
+            kicad_style_table(
+                "sym_lib_table",
+                &[
+                    ("SharedNick", "KiCad", &symdir.to_string_lossy()),
+                    ("SharedNick", "KiCad", &later.to_string_lossy()),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "query": "Priority",
+            "project_dir": project.to_string_lossy(),
+        });
+        let res = handle_search_symbols(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(
+            out["results"],
+            json!([{
+                "library": "SharedNick",
+                "name": "PriorityProjectOnly",
+                "id": "SharedNick:PriorityProjectOnly"
+            }]),
+            "먼저 등록된 프로젝트 항목과 결과 중복 제거가 함께 유지되어야 함: {out}"
+        );
+    }
+
+    /// `limit: 0`은 등록 라이브러리를 읽더라도 빈 결과여야 한다.
+    #[tokio::test]
+    async fn search_symbols_honors_zero_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let single = tmp.path().join("Zero.kicad_sym");
+        std::fs::write(&single, "(kicad_symbol_lib (symbol \"ZeroHit\"))\n").unwrap();
+        std::fs::write(
+            tmp.path().join("sym-lib-table"),
+            kicad_style_table(
+                "sym_lib_table",
+                &[("Zero", "KiCad", &single.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "query": "ZeroHit",
+            "limit": 0,
+            "project_dir": tmp.path().to_string_lossy(),
+        });
+        let res = handle_search_symbols(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["count"], 0, "limit=0인데 결과가 누출됨: {out}");
+        assert_eq!(
+            out["results"],
+            json!([]),
+            "limit=0인데 결과가 누출됨: {out}"
+        );
+    }
+
+    /// 읽을 수 없는 심볼 파일을 빈 검색 결과로 위장하면 안 된다.
+    #[tokio::test]
+    async fn search_symbols_reports_unreadable_registered_symbol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let symdir = tmp.path().join("Broken.kicad_symdir");
+        std::fs::create_dir(&symdir).unwrap();
+        std::fs::create_dir(symdir.join("Broken.kicad_sym")).unwrap();
+        std::fs::write(
+            tmp.path().join("sym-lib-table"),
+            kicad_style_table(
+                "sym_lib_table",
+                &[("Broken", "KiCad", &symdir.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "query": "Broken",
+            "project_dir": tmp.path().to_string_lossy(),
+        });
+        let res = handle_search_symbols(&args, &test_ctx()).await.unwrap();
+        assert!(
+            res.is_error,
+            "읽기 실패가 count=0으로 은폐됨: {:?}",
+            res.content
+        );
+        assert!(result_text(&res).contains("Broken.kicad_sym"));
+    }
+
+    /// 읽을 수 없는 프로젝트 테이블도 빈 검색 결과와 구분해야 한다.
+    #[tokio::test]
+    async fn search_symbols_reports_unreadable_project_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sym-lib-table")).unwrap();
+        let args = json!({
+            "query": "anything",
+            "project_dir": tmp.path().to_string_lossy(),
+        });
+        let res = handle_search_symbols(&args, &test_ctx()).await.unwrap();
+        assert!(
+            res.is_error,
+            "읽기 실패가 count=0으로 은폐됨: {:?}",
+            res.content
+        );
+        assert!(result_text(&res).contains("sym-lib-table"));
     }
 
     /// A 14-pin module with pins declared on two facing columns, as the report

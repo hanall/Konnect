@@ -1789,15 +1789,22 @@ async fn export_position_file_with_options(
 
 /// KiCAD 10: `pcb export ipcd356 --output <path> <input>`
 pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("IPC-D-356 output has no file name")?,
+    );
     let args = [
         "pcb",
         "export",
         "ipcd356",
         "--output",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "IPC-D-356 netlist").await?;
     Ok(())
 }
 

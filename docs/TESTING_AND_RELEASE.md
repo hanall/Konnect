@@ -29,8 +29,21 @@ cargo fmt --all -- --check
 | Python plugin | `plugin/tests` and the plugin CI job |
 | PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
 
-The viewer is outside the Cargo workspace. Build or test it from
-`crates/schematic-viewer`; workspace commands do not cover it.
+viewer는 Cargo workspace 밖에 있으며 자체 lockfile을 사용합니다. Workspace
+명령은 viewer를 검사하지 않으므로 다음 gate를 별도로 실행합니다.
+
+```bash
+cargo test --manifest-path crates/schematic-viewer/Cargo.toml --locked
+cargo clippy --manifest-path crates/schematic-viewer/Cargo.toml --all-targets --locked -- -D warnings
+cargo build --manifest-path crates/schematic-viewer/Cargo.toml --release --locked
+```
+
+release 검증에서는 viewer binary를 `konnect` binary와 같은 directory에 두고
+`open_schematic_viewer`를 실제 browser 환경에서 호출합니다. 성공 근거는 process
+spawn이 아니라 `ready: true`, 일치하는 viewer PID, `127.0.0.1` capability URL,
+`browser_connected`, `root_rendered`, `auto_refresh_watcher`,
+`source: isolated_snapshot`입니다. Browser가 SVG를 실제 load하지 못하면 readiness
+timeout이어야 하며 성공으로 기록하면 안 됩니다.
 
 ## Evidence-Focused Regression Tests
 

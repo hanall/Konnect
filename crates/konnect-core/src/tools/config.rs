@@ -444,7 +444,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Dot-notation path to the config key, e.g. 'fab_constraints.fab_house' or 'default_passives.decoupling_cap'"
                     },
                     "value": {
-                        "description": "New value to set (string, number, array, or object)"
+                        "type": ["string", "number", "boolean", "array", "object"],
+                        "additionalProperties": true,
+                        "description": "New non-null JSON value to set: string, number, boolean, array, or object"
                     }
                 },
                 "required": ["key_path", "value"]
@@ -479,7 +481,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory (optional, uses configured default)" },
                     "key_path": { "type": "string", "description": "Dot-notation config key" },
-                    "value": { "description": "New value to set" }
+                    "value": {
+                        "type": ["string", "number", "boolean", "array", "object"],
+                        "additionalProperties": true,
+                        "description": "New non-null JSON value to set: string, number, boolean, array, or object"
+                    }
                 },
                 "required": ["key_path", "value"]
             }),
@@ -912,7 +918,9 @@ mod dot_path_and_merge_tests {
 mod config_state_tests {
     use super::*;
     use crate::mcp::error::extract_error_kind;
+    use crate::mcp::handler::McpHandler;
     use crate::mcp::protocol::ToolContent;
+    use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
 
     /// A truncated document that still visibly holds the user's settings.
     const TRUNCATED: &str =
@@ -939,6 +947,270 @@ mod config_state_tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    fn server_config(project_dir: Option<PathBuf>) -> ServerConfig {
+        ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        }
+    }
+
+    async fn call_public_tool(
+        handler: &McpHandler,
+        id: u64,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        let result = response
+            .result
+            .expect("tools/call stays in the MCP result envelope");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("config tools return JSON text");
+        (
+            result["isError"] == json!(true),
+            serde_json::from_str(text).expect("config tool body is JSON"),
+        )
+    }
+
+    struct ConfigHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old_appdata: Option<std::ffi::OsString>,
+        old_home: Option<std::ffi::OsString>,
+    }
+
+    impl ConfigHome {
+        fn at(path: &Path) -> Self {
+            let guard = KICAD_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let old_appdata = std::env::var_os("APPDATA");
+            let old_home = std::env::var_os("HOME");
+            std::env::set_var("APPDATA", path);
+            std::env::set_var("HOME", path);
+            Self {
+                _guard: guard,
+                old_appdata,
+                old_home,
+            }
+        }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            match self.old_appdata.take() {
+                Some(value) => std::env::set_var("APPDATA", value),
+                None => std::env::remove_var("APPDATA"),
+            }
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_value_schemas_advertise_every_supported_non_null_json_kind() {
+        let expected = json!(["string", "number", "boolean", "array", "object"]);
+        for tool in tools()
+            .into_iter()
+            .filter(|tool| matches!(tool.name, "save_user_config" | "save_project_config"))
+        {
+            assert_eq!(
+                tool.input_schema["properties"]["value"]["type"], expected,
+                "{}",
+                tool.name
+            );
+            assert_eq!(
+                tool.input_schema["properties"]["value"]["additionalProperties"], true,
+                "{} must keep nested caller-owned object keys",
+                tool.name
+            );
+            assert_eq!(
+                tool.input_schema["additionalProperties"], false,
+                "{}",
+                tool.name
+            );
+            let nested = json!({
+                "key_path": "private",
+                "value": {"nested": {"array": [1, {"free": true}]}}
+            });
+            assert!(tool.input_validator.is_valid(&nested), "{}", tool.name);
+            assert!(
+                !tool.input_validator.is_valid(&json!({
+                    "key_path": "private", "value": "ok", "typo": true
+                })),
+                "{} must still refuse unknown top-level arguments",
+                tool.name
+            );
+            assert!(
+                !tool
+                    .input_validator
+                    .is_valid(&json!({"key_path": "private", "value": null})),
+                "{} must refuse null",
+                tool.name
+            );
+
+            // Negative controls: either guard becoming the opposite makes the
+            // matching request pass/fail, so the assertions above are not vacuous.
+            let mut closes_caller_value = tool.input_schema.clone();
+            closes_caller_value["properties"]["value"]["additionalProperties"] = json!(false);
+            let closed = crate::tools::compile_input_validator(
+                "closed_config_value_control",
+                &closes_caller_value,
+            );
+            assert!(
+                !closed.is_valid(&nested),
+                "{} nested-value control",
+                tool.name
+            );
+
+            let mut opens_top_level = tool.input_schema.clone();
+            opens_top_level["additionalProperties"] = json!(true);
+            let open = crate::tools::compile_input_validator(
+                "open_config_arguments_control",
+                &opens_top_level,
+            );
+            assert!(
+                open.is_valid(&json!({"key_path": "private", "value": "ok", "typo": true})),
+                "{} top-level control",
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn save_user_config_accepts_each_non_null_json_kind_and_reads_it_back() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = ConfigHome::at(home.path());
+        let handler = McpHandler::new(server_config(None))
+            .await
+            .expect("handler builds");
+        let values = [
+            ("string", json!("JLCPCB")),
+            ("number", json!(0.15)),
+            ("boolean", json!(true)),
+            ("array", json!(["Murata", "TDK"])),
+            ("object", json!({"nested": {"limit": 2}, "enabled": true})),
+        ];
+
+        for (index, (kind, value)) in values.into_iter().enumerate() {
+            let key_path = format!("catalogue_probe.{kind}");
+            let (is_error, saved) = call_public_tool(
+                &handler,
+                index as u64 * 2 + 1,
+                "save_user_config",
+                json!({"key_path": key_path, "value": value}),
+            )
+            .await;
+            assert!(!is_error, "{kind}: {saved}");
+            assert_eq!(saved["value"], value, "{kind}: save response");
+
+            let (is_error, loaded) = call_public_tool(
+                &handler,
+                index as u64 * 2 + 2,
+                "load_user_config",
+                json!({}),
+            )
+            .await;
+            assert!(!is_error, "{kind}: {loaded}");
+            assert_eq!(
+                loaded["config"]["catalogue_probe"][kind], value,
+                "{kind}: readback"
+            );
+        }
+
+        let config = user_config_path();
+        let before = std::fs::read(&config).unwrap();
+        let (is_error, refusal) = call_public_tool(
+            &handler,
+            99,
+            "save_user_config",
+            json!({"key_path": "catalogue_probe.null", "value": null}),
+        )
+        .await;
+        assert!(is_error, "{refusal}");
+        assert_eq!(refusal["error"]["kind"], "invalid_argument", "{refusal}");
+        assert_eq!(refusal["error"]["field"], "value", "{refusal}");
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "null refusal wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_project_config_accepts_each_non_null_json_kind_and_reads_it_back() {
+        let project = tempfile::tempdir().unwrap();
+        let handler = McpHandler::new(server_config(Some(project.path().to_path_buf())))
+            .await
+            .expect("handler builds");
+        let values = [
+            ("string", json!("JLCPCB")),
+            ("number", json!(0.15)),
+            ("boolean", json!(true)),
+            ("array", json!(["Murata", "TDK"])),
+            ("object", json!({"nested": {"limit": 2}, "enabled": true})),
+        ];
+
+        for (index, (kind, value)) in values.into_iter().enumerate() {
+            let key_path = format!("catalogue_probe.{kind}");
+            let (is_error, saved) = call_public_tool(
+                &handler,
+                index as u64 * 2 + 1,
+                "save_project_config",
+                json!({"key_path": key_path, "value": value}),
+            )
+            .await;
+            assert!(!is_error, "{kind}: {saved}");
+            assert_eq!(saved["value"], value, "{kind}: save response");
+
+            let (is_error, loaded) = call_public_tool(
+                &handler,
+                index as u64 * 2 + 2,
+                "load_project_config",
+                json!({}),
+            )
+            .await;
+            assert!(!is_error, "{kind}: {loaded}");
+            assert_eq!(
+                loaded["config"]["catalogue_probe"][kind], value,
+                "{kind}: readback"
+            );
+        }
+
+        let config = project_config_path(project.path());
+        let before = std::fs::read(&config).unwrap();
+        let (is_error, refusal) = call_public_tool(
+            &handler,
+            99,
+            "save_project_config",
+            json!({"key_path": "catalogue_probe.null", "value": null}),
+        )
+        .await;
+        assert!(is_error, "{refusal}");
+        assert_eq!(refusal["error"]["kind"], "invalid_argument", "{refusal}");
+        assert_eq!(refusal["error"]["field"], "value", "{refusal}");
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "null refusal wrote nothing"
+        );
     }
 
     #[test]

@@ -2497,7 +2497,7 @@ mod tests {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::SavedDocumentResponse {
                             contents: live.clone(),
-                            document: None,
+                            document: <kiapi::common::commands::SaveDocumentToString as prost::Message>::decode(command.value.as_slice()).unwrap().document,
                         },
                         "kiapi.common.commands.SavedDocumentResponse",
                     ))
@@ -2562,7 +2562,7 @@ mod tests {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::SavedDocumentResponse {
                             contents: live.clone(),
-                            document: None,
+                            document: <kiapi::common::commands::SaveDocumentToString as prost::Message>::decode(command.value.as_slice()).unwrap().document,
                         },
                         "kiapi.common.commands.SavedDocumentResponse",
                     ))
@@ -2629,7 +2629,7 @@ mod tests {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::SavedDocumentResponse {
                             contents: live_after_move.clone(),
-                            document: None,
+                            document: <kiapi::common::commands::SaveDocumentToString as prost::Message>::decode(command.value.as_slice()).unwrap().document,
                         },
                         "kiapi.common.commands.SavedDocumentResponse",
                     ))
@@ -2683,7 +2683,7 @@ mod tests {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::SavedDocumentResponse {
                             contents: live_after_move.clone(),
-                            document: None,
+                            document: <kiapi::common::commands::SaveDocumentToString as prost::Message>::decode(command.value.as_slice()).unwrap().document,
                         },
                         "kiapi.common.commands.SavedDocumentResponse",
                     ))

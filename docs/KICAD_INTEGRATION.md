@@ -46,6 +46,14 @@ Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
 scoped exceptions with explicit geometry checks. They are not a general license
 to edit a live board file.
 
+`set_active_layer` is an editor-session mutation, not a board-file edit. It
+binds one exact open board through `GetOpenDocuments`, sends typed
+`GetActiveLayer` / `SetActiveLayer` / `GetActiveLayer` requests carrying that
+same `DocumentSpecifier`, and reports success only when the final readback is
+the requested layer. Once the set has been delivered, an unreadable response,
+failed readback, or mismatching readback is an uncertain outcome and must not
+be retried blindly or converted into a file fallback.
+
 `flip_component` on an *open* board no longer falls into that closed-board
 exception: KiCad 10.0.6 added a native `FlipItems` IPC command, so
 `handle_flip_component` drives it through `attempt_ipc_write` like the other
@@ -106,12 +114,23 @@ Duplicate or empty KIID requests are rejected before IPC.
 footprint, or the footprint back to the symbol, from KiCad's saved footprint
 symbol-path linkage. It requires the explicit project, both saved documents,
 the schematic hierarchy instance, and the source KIID; reference agreement is
-checked as an additional consistency guard. Both requested editor documents
-must also be proven open through typed `GetOpenDocuments` readback. Missing,
-duplicate, malformed, or instance-inconsistent links return a structured
-`unresolved_cross_probe_destination` instead of guessing. The operation is
-resolve-only: it does not activate an editor or mutate selection, and pin/pad/
-net expansion remains unsupported until one stable destination can be proven.
+checked as an additional consistency guard. By default both requested editor
+documents must also be proven open through typed `GetOpenDocuments` readback.
+Missing, duplicate, malformed, or instance-inconsistent links return a
+structured `unresolved_cross_probe_destination` instead of guessing.
+
+Some KiCad manager endpoints expose the root schematic as an unbound
+`BoardFilename`, which cannot prove exact live schematic identity. The explicit
+`allow_saved_schematic_context: true` option permits only a resolve-only,
+root-sheet fallback: the PCB remains exact-live-bound; project, schematic, and
+board must be canonical same-stem siblings; the manager basename must be
+unique; and the root sheet KIID must match the saved schematic. The result
+labels that authority `saved_file`, says `live_schematic_exact: false`, and
+revision-binds both saved documents with equal before/after bytes and SHA-256.
+It does not synthesize a live schematic `DocumentSpecifier`, activate an
+editor, or mutate selection. Hierarchical sheets and any ambiguity fail closed.
+Pin/pad/net expansion remains unsupported until one stable destination can be
+proven.
 
 ## Schematic-To-Board Sync
 
@@ -222,11 +241,19 @@ your settings file or download a database at startup.
 
 ## Plugin, Viewer, And Packaging
 
-`plugin` contains the legacy KiCad 10 Python ActionPlugin for settings/server
-control and the optional native Specctra bridge. `plugin.json` declares the
-separate executable IPC integration that is the forward path. The standalone viewer in
-`crates/schematic-viewer` watches schematic files and renders through
-`kicad-cli`; it is built and tested separately from the Rust workspace.
+`plugin`에는 설정·server 제어용 legacy KiCad 10 Python ActionPlugin과 선택적인
+native Specctra bridge가 있습니다. `plugin.json`은 앞으로 사용할 별도 executable
+IPC integration을 선언합니다. `crates/schematic-viewer`의 standalone viewer는
+schematic file을 감시하고 `kicad-cli`로 SVG를 생성하지만, live file을 직접
+render source로 넘기지 않습니다. root project directory 안의 hierarchy를 먼저
+검증하고 symlink, `..`, absolute child reference, project 밖 reference를 거부한 뒤
+권한이 격리된 임시 snapshot에서만 render합니다.
+
+viewer는 `127.0.0.1` random port에만 bind하고 capability token이 있는 URL을
+시스템 브라우저로 엽니다. MCP의 `open_schematic_viewer`는 browser가 page와
+state, SVG를 수신하고 `img.onload` 뒤 same-origin readiness를 보낸 사실, root
+render 성공, file watcher 활성화를 모두 확인한 뒤에만 성공합니다. viewer는
+자체 lockfile을 사용하며 main Rust workspace와 별도로 build/test합니다.
 
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer

@@ -13,28 +13,30 @@ use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
     require_array, require_f64, require_str,
     sch_wiring::{
-        apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
-        observed_no_connect_moves, plan_no_connect_carry_for_replacement,
-        reconcile_junctions_for_placement,
+        apply_no_connect_carries, carry_no_connects, insert_before_close,
+        no_connect_carry_unwritable, observed_no_connect_moves,
+        plan_no_connect_carry_for_replacement, reconcile_junctions_for_placement,
     },
     ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
-    geometry::snap_point,
+    geometry::{points_coincident, round6, snap_point},
     parse_sexp, prepare_command,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
-        pin_outward_direction, read_schematic,
+        extract_all_net_labels, extract_buses, extract_labels, extract_lib_pins_for_unit,
+        extract_symbol_instances, extract_wires, find_lib_symbol, format_wire, pin_endpoint,
+        pin_outward_direction, read_schematic, LabelKind,
     },
     writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
+        write_new_atomic, SexpEdit,
     },
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -186,15 +188,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
-            // No parameters: the handler refuses unconditionally, and the
-            // schema-parameter guard (rightly) refuses a schema that advertises
-            // arguments nothing reads. The old parameters are documented in
-            // docs/API_MIGRATIONS.md alongside #285's removals.
+            "Move a component while preserving its saved electrical connectivity. Existing wire UUIDs and remote endpoints stay fixed; Konnect adds the minimum orthogonal bridge segments from each moved pin back to its proven fixed attachment, carries directly attached labels and no-connect markers, and refuses atomically unless both its connectivity graph and an independent kicad-cli netlist remain equivalent.",
             json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "reference": { "type": "string", "description": "Component reference designator" },
+                    "x": { "type": "number", "description": "New X position in mm for the lowest-numbered unit" },
+                    "y": { "type": "number", "description": "New Y position in mm for the lowest-numbered unit" }
+                },
+                "required": ["schematic", "reference", "x", "y"]
             }),
             |args, ctx| async move { handle_move_connected(args, ctx).await }
         ),
@@ -3232,18 +3235,785 @@ async fn handle_rotate_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ConnectivityClass {
+    anchors: Vec<String>,
+    aliases: Vec<String>,
+}
+
+type SchematicPoint = (f64, f64);
+type PinMoveMap = BTreeMap<String, (SchematicPoint, SchematicPoint)>;
+type WireEndpoints = (f64, f64, f64, f64);
+type ExistingWireMap = BTreeMap<String, WireEndpoints>;
+type SegmentKey = (i64, i64, i64, i64);
+type SegmentMap = BTreeMap<SegmentKey, (SchematicPoint, SchematicPoint)>;
+type NetlistNode = (String, String);
+type NetlistSignature = Vec<(String, Vec<NetlistNode>)>;
+
+/// 배치된 pin과 실제 label identity가 이루는 net partition이다.
+///
+/// root 좌표 자체는 이동으로 달라지므로 비교하지 않는다. 대신 같은 root에
+/// 속한 identity 집합과 그 root의 모든 alias를 정렬해 비교한다. bridge가 새
+/// wire UUID를 만들더라도 전기적 terminal partition은 같아야 한다.
+fn connectivity_signature(source: &str) -> Result<Vec<ConnectivityClass>, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &labels);
+    let placed = crate::tools::resolved_placed_pins_by_reference(&tree)
+        .ok_or_else(|| crate::tools::UNRESOLVED_PIN_GEOMETRY.to_string())?;
+
+    let mut anchors = Vec::new();
+    for (instance, pins) in placed {
+        let uuid = instance
+            .uuid
+            .as_deref()
+            .ok_or_else(|| format!("component {} has no UUID", instance.reference))?;
+        for (occurrence, (pin, transform)) in pins.into_iter().enumerate() {
+            let at = pin_endpoint(&pin, transform);
+            anchors.push((
+                format!(
+                    "pin:{uuid}:unit{}:{}:occurrence{occurrence}",
+                    instance.unit, pin.number
+                ),
+                at,
+            ));
+        }
+    }
+    for (ordinal, label) in extract_labels(&tree).into_iter().enumerate() {
+        let id = label
+            .uuid
+            .as_deref()
+            .map(|uuid| format!("label:{uuid}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "label:{}:{}:occurrence{ordinal}",
+                    label_kind_name(label.kind),
+                    label.net
+                )
+            });
+        anchors.push((id, (label.x, label.y)));
+    }
+
+    let mut grouped: HashMap<(i64, i64), Vec<String>> = HashMap::new();
+    for (id, (x, y)) in anchors {
+        grouped.entry(graph.root_at(x, y)).or_default().push(id);
+    }
+    let mut classes = Vec::new();
+    for (root, mut class_anchors) in grouped {
+        class_anchors.sort();
+        class_anchors.dedup();
+        classes.push(ConnectivityClass {
+            anchors: class_anchors,
+            aliases: graph.aliases_of_root(root).into_iter().collect(),
+        });
+    }
+    classes.sort();
+    Ok(classes)
+}
+
+fn label_kind_name(kind: LabelKind) -> &'static str {
+    match kind {
+        LabelKind::NetLabel => "label",
+        LabelKind::GlobalLabel => "global_label",
+        LabelKind::HierarchicalLabel => "hierarchical_label",
+        LabelKind::PowerSymbol => "power_symbol",
+    }
+}
+
+fn selected_pin_positions(
+    source: &str,
+    selected_uuids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, (f64, f64)>, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let placed = crate::tools::resolved_placed_pins_by_reference(&tree)
+        .ok_or_else(|| crate::tools::UNRESOLVED_PIN_GEOMETRY.to_string())?;
+    let mut out = BTreeMap::new();
+    for (instance, pins) in placed {
+        let Some(uuid) = instance.uuid.as_ref() else {
+            return Err(format!("component {} has no UUID", instance.reference));
+        };
+        if !selected_uuids.contains(uuid) {
+            continue;
+        }
+        for (occurrence, (pin, transform)) in pins.into_iter().enumerate() {
+            let id = format!(
+                "pin:{uuid}:unit{}:{}:occurrence{occurrence}",
+                instance.unit, pin.number
+            );
+            if out
+                .insert(id.clone(), pin_endpoint(&pin, transform))
+                .is_some()
+            {
+                return Err(format!("duplicate selected pin identity {id}"));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err("selected component has no resolved pins".to_string());
+    }
+    Ok(out)
+}
+
+fn existing_wire_map(source: &str) -> Result<ExistingWireMap, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let mut out = BTreeMap::new();
+    for wire in extract_wires(&tree) {
+        let uuid = wire
+            .uuid
+            .ok_or_else(|| "an existing wire has no UUID".to_string())?;
+        if out
+            .insert(uuid.clone(), (wire.x1, wire.y1, wire.x2, wire.y2))
+            .is_some()
+        {
+            return Err(format!("duplicate wire UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn remote_component_map(
+    source: &str,
+    selected_uuids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let mut out = BTreeMap::new();
+    for item in extract_symbol_instances(&tree) {
+        let uuid = item
+            .uuid
+            .as_ref()
+            .ok_or_else(|| format!("component {} has no UUID", item.reference))?;
+        if selected_uuids.contains(uuid) {
+            continue;
+        }
+        let signature = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            item.reference,
+            item.unit,
+            round6(item.x),
+            round6(item.y),
+            round6(item.rotation),
+            item.mirror_x,
+            item.mirror_y,
+            item.lib_symbol_name()
+        );
+        if out.insert(uuid.clone(), signature).is_some() {
+            return Err(format!("duplicate component UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn junction_signature(source: &str) -> Result<BTreeMap<String, (i64, i64)>, String> {
+    let mut out = BTreeMap::new();
+    for (start, end) in find_direct_child_blocks(source, "kicad_sch") {
+        let node = parse_sexp(&source[start..end]).map_err(|error| error.to_string())?;
+        if node.head() != Some("junction") {
+            continue;
+        }
+        let uuid = node
+            .find_str("uuid")
+            .ok_or_else(|| "an existing junction has no UUID".to_string())?;
+        let (x, y, _) = konnect_sexp::schematic::parse_at(&node)
+            .ok_or_else(|| format!("junction {uuid} has no readable (at)"))?;
+        if out
+            .insert(
+                uuid.to_owned(),
+                crate::tools::sch_connectivity::pt_key(x, y),
+            )
+            .is_some()
+        {
+            return Err(format!("duplicate junction UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn physical_label_map(source: &str) -> Result<BTreeMap<String, String>, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let mut out = BTreeMap::new();
+    for label in extract_labels(&tree) {
+        let uuid = label
+            .uuid
+            .ok_or_else(|| format!("label '{}' has no UUID", label.net))?;
+        let signature = format!(
+            "{}|{}|{}|{}|{}",
+            label_kind_name(label.kind),
+            label.net,
+            round6(label.x),
+            round6(label.y),
+            round6(label.rotation)
+        );
+        if out.insert(uuid.clone(), signature).is_some() {
+            return Err(format!("duplicate label UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn expected_label_map_after_move(
+    source: &str,
+    pin_moves: &PinMoveMap,
+) -> Result<BTreeMap<String, String>, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let mut out = BTreeMap::new();
+    for label in extract_labels(&tree) {
+        let uuid = label
+            .uuid
+            .ok_or_else(|| format!("label '{}' has no UUID", label.net))?;
+        let destination = pin_moves
+            .values()
+            .find(|(old, _)| points_coincident(label.x, label.y, old.0, old.1, 0.01))
+            .map(|(_, new)| *new)
+            .unwrap_or((label.x, label.y));
+        let signature = format!(
+            "{}|{}|{}|{}|{}",
+            label_kind_name(label.kind),
+            label.net,
+            round6(destination.0),
+            round6(destination.1),
+            round6(label.rotation)
+        );
+        if out.insert(uuid.clone(), signature).is_some() {
+            return Err(format!("duplicate label UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn no_connect_map(
+    source: &str,
+    pin_moves: Option<&PinMoveMap>,
+) -> Result<BTreeMap<String, (i64, i64)>, String> {
+    let mut out = BTreeMap::new();
+    for (start, end) in find_direct_child_blocks(source, "kicad_sch") {
+        let node = parse_sexp(&source[start..end]).map_err(|error| error.to_string())?;
+        if node.head() != Some("no_connect") {
+            continue;
+        }
+        let uuid = node
+            .find_str("uuid")
+            .ok_or_else(|| "a no-connect marker has no UUID".to_string())?;
+        let (x, y, _) = konnect_sexp::schematic::parse_at(&node)
+            .ok_or_else(|| format!("no-connect {uuid} has no readable (at)"))?;
+        let destination = pin_moves
+            .and_then(|moves| {
+                moves
+                    .values()
+                    .find(|(old, _)| points_coincident(x, y, old.0, old.1, 0.01))
+                    .map(|(_, new)| *new)
+            })
+            .unwrap_or((x, y));
+        if out
+            .insert(
+                uuid.to_owned(),
+                crate::tools::sch_connectivity::pt_key(destination.0, destination.1),
+            )
+            .is_some()
+        {
+            return Err(format!("duplicate no-connect UUID {uuid}"));
+        }
+    }
+    Ok(out)
+}
+
+fn no_connect_collisions_absent(
+    before: &str,
+    candidate: &str,
+    pin_moves: &PinMoveMap,
+) -> Result<bool, String> {
+    let before_markers = no_connect_map(before, None)?;
+    let candidate_markers = no_connect_map(candidate, None)?;
+    let old_points = pin_moves
+        .values()
+        .map(|(old, _)| crate::tools::sch_connectivity::pt_key(old.0, old.1))
+        .collect::<BTreeSet<_>>();
+    let moved_marker_ids = before_markers
+        .iter()
+        .filter(|(_, point)| old_points.contains(point))
+        .map(|(uuid, _)| uuid.clone())
+        .collect::<BTreeSet<_>>();
+    for (_, new) in pin_moves.values() {
+        let new_key = crate::tools::sch_connectivity::pt_key(new.0, new.1);
+        if candidate_markers
+            .iter()
+            .any(|(uuid, point)| *point == new_key && !moved_marker_ids.contains(uuid))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remote_geometry_preserved(
+    before: &str,
+    candidate: &str,
+    selected_uuids: &BTreeSet<String>,
+    pin_moves: &PinMoveMap,
+) -> Result<bool, String> {
+    let before_wires = existing_wire_map(before)?;
+    let candidate_wires = existing_wire_map(candidate)?;
+    if before_wires
+        .iter()
+        .any(|(uuid, endpoints)| candidate_wires.get(uuid) != Some(endpoints))
+    {
+        return Ok(false);
+    }
+    if remote_component_map(before, selected_uuids)?
+        != remote_component_map(candidate, selected_uuids)?
+    {
+        return Ok(false);
+    }
+    if junction_signature(before)? != junction_signature(candidate)? {
+        return Ok(false);
+    }
+    if expected_label_map_after_move(before, pin_moves)? != physical_label_map(candidate)? {
+        return Ok(false);
+    }
+    if no_connect_map(before, Some(pin_moves))? != no_connect_map(candidate, None)? {
+        return Ok(false);
+    }
+    no_connect_collisions_absent(before, candidate, pin_moves)
+}
+
+/// 직접 pin 위의 실제 label만 같은 delta로 옮긴다. power symbol의 net 이름은
+/// symbol 자체에서 파생되므로 여기서 별도 label처럼 다시 움직이지 않는다.
+fn move_attached_labels(
+    source: String,
+    pin_moves: &PinMoveMap,
+) -> Result<(String, Vec<String>), String> {
+    let mut edits = Vec::new();
+    let mut moved = Vec::new();
+    for (start, end) in find_direct_child_blocks(&source, "kicad_sch") {
+        let node = parse_sexp(&source[start..end]).map_err(|error| error.to_string())?;
+        if !matches!(
+            node.head(),
+            Some("label" | "global_label" | "hierarchical_label")
+        ) {
+            continue;
+        }
+        let Some((x, y, rotation)) = konnect_sexp::schematic::parse_at(&node) else {
+            return Err("a schematic label has no readable (at)".to_string());
+        };
+        let Some((_, (_, new))) = pin_moves
+            .iter()
+            .find(|(_, (old, _))| points_coincident(x, y, old.0, old.1, 0.01))
+        else {
+            continue;
+        };
+        let uuid = node
+            .find_str("uuid")
+            .ok_or_else(|| format!("attached label at ({x}, {y}) has no UUID"))?;
+        let block = &source[start..end];
+        let at_rel = block
+            .find("(at ")
+            .ok_or_else(|| format!("label {uuid} has no (at) block"))?;
+        let at_value = start + at_rel + "(at ".len();
+        let at_close = source[at_value..]
+            .find(')')
+            .map(|offset| at_value + offset)
+            .ok_or_else(|| format!("label {uuid} has malformed (at)"))?;
+        edits.push(SexpEdit::replace(
+            at_value,
+            at_close,
+            format!("{} {} {}", round6(new.0), round6(new.1), rotation),
+        ));
+        moved.push(uuid.to_owned());
+    }
+    moved.sort();
+    moved.dedup();
+    Ok((apply_edits(source, edits), moved))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BridgeOrder {
+    HorizontalFirst,
+    VerticalFirst,
+}
+
+fn add_bridge_segments(
+    mut source: String,
+    bridges: &[(SchematicPoint, SchematicPoint)],
+    order: BridgeOrder,
+) -> (String, usize) {
+    let mut segments: SegmentMap = BTreeMap::new();
+    for &(old, new) in bridges {
+        let old = (round6(old.0), round6(old.1));
+        let new = (round6(new.0), round6(new.1));
+        if points_coincident(old.0, old.1, new.0, new.1, 0.000001) {
+            continue;
+        }
+        let elbow = if points_coincident(old.0, old.1, new.0, new.1, 0.01)
+            || (old.0 - new.0).abs() < 0.000001
+            || (old.1 - new.1).abs() < 0.000001
+        {
+            None
+        } else {
+            Some(match order {
+                BridgeOrder::HorizontalFirst => (new.0, old.1),
+                BridgeOrder::VerticalFirst => (old.0, new.1),
+            })
+        };
+        let mut add = |a: (f64, f64), b: (f64, f64)| {
+            if points_coincident(a.0, a.1, b.0, b.1, 0.000001) {
+                return;
+            }
+            let a_key = crate::tools::sch_connectivity::pt_key(a.0, a.1);
+            let b_key = crate::tools::sch_connectivity::pt_key(b.0, b.1);
+            let (first, second, first_point, second_point) = if a_key <= b_key {
+                (a_key, b_key, a, b)
+            } else {
+                (b_key, a_key, b, a)
+            };
+            segments.insert(
+                (first.0, first.1, second.0, second.1),
+                (first_point, second_point),
+            );
+        };
+        if let Some(elbow) = elbow {
+            add(old, elbow);
+            add(elbow, new);
+        } else {
+            add(old, new);
+        }
+    }
+    let count = segments.len();
+    if count == 0 {
+        return (source, 0);
+    }
+    let insertion = segments
+        .into_iter()
+        .map(|(_, (a, b))| format_wire(a.0, a.1, b.0, b.1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    source = insert_before_close(&source, &insertion);
+    (source, count)
+}
+
+fn exported_netlist_signature(source: &str) -> Result<NetlistSignature, String> {
+    let tree = parse_sexp(source).map_err(|error| error.to_string())?;
+    let Some(nets) = tree.find("nets") else {
+        return Err("kicad-cli netlist has no (nets) block".to_string());
+    };
+    let mut signature = Vec::new();
+    for net in nets.find_all("net") {
+        let name = net.find_str("name").unwrap_or_default().to_string();
+        let mut nodes = net
+            .find_all("node")
+            .into_iter()
+            .filter_map(|node| {
+                Some((
+                    node.find_str("ref")?.to_string(),
+                    node.find_str("pin")?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        nodes.sort();
+        signature.push((name, nodes));
+    }
+    signature.sort();
+    Ok(signature)
+}
+
+struct TemporaryFiles(Vec<std::path::PathBuf>);
+
+impl Drop for TemporaryFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn kicad_cli_netlist_signature(
+    cli: &str,
+    schematic: &std::path::Path,
+    candidate_source: Option<&str>,
+) -> Result<NetlistSignature, String> {
+    if cli.trim().is_empty() {
+        return Err("kicad-cli path is empty; independent netlist verification is required".into());
+    }
+    let parent = schematic.parent().unwrap_or(std::path::Path::new("."));
+    let token = konnect_sexp::writer::new_uuid();
+    let candidate_path = parent.join(format!(".konnect-move-connected-{token}.kicad_sch"));
+    let output_path = parent.join(format!(".konnect-move-connected-{token}.net"));
+    let mut cleanup = TemporaryFiles(vec![output_path.clone()]);
+    let input = if let Some(source) = candidate_source {
+        write_new_atomic(&candidate_path, source).map_err(|error| error.to_string())?;
+        cleanup.0.push(candidate_path.clone());
+        &candidate_path
+    } else {
+        schematic
+    };
+    crate::tools::cli::export_netlist(cli, input, &output_path, "kicad")
+        .await
+        .map_err(|error| format!("kicad-cli netlist export failed: {error}"))?;
+    let exported = std::fs::read_to_string(&output_path)
+        .map_err(|error| format!("cannot read kicad-cli netlist: {error}"))?;
+    exported_netlist_signature(&exported)
+}
+
+fn required_bridges(
+    before_source: &str,
+    pin_moves: &PinMoveMap,
+) -> Result<Vec<(SchematicPoint, SchematicPoint)>, String> {
+    let tree = parse_sexp(before_source).map_err(|error| error.to_string())?;
+    let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &buses,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
+    let mut selected_at: HashMap<(i64, i64), usize> = HashMap::new();
+    for (old, _) in pin_moves.values() {
+        *selected_at
+            .entry(crate::tools::sch_connectivity::pt_key(old.0, old.1))
+            .or_default() += 1;
+    }
+    let mut unique = BTreeMap::new();
+    for (old, new) in pin_moves.values() {
+        let selected_here = selected_at
+            .get(&crate::tools::sch_connectivity::pt_key(old.0, old.1))
+            .copied()
+            .unwrap_or(0);
+        let fixed_attachment = index.has_wire_end(old.0, old.1)
+            || (index.has_junction(old.0, old.1) && index.on_wire(old.0, old.1))
+            || index.has_sheet_pin(old.0, old.1)
+            || index.has_bus_entry_wire_end(old.0, old.1)
+            || index.pins_at(old.0, old.1) > selected_here;
+        if fixed_attachment {
+            let key = (
+                crate::tools::sch_connectivity::pt_key(old.0, old.1),
+                crate::tools::sch_connectivity::pt_key(new.0, new.1),
+            );
+            unique.insert(key, (*old, *new));
+        }
+    }
+    Ok(unique.into_values().collect())
+}
+
 async fn handle_move_connected(
-    _args: &serde_json::Value,
-    _ctx: &ToolContext,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // Since the first release this silently delegated to the plain move and
-    // reported success — the symbol moved, every wire stayed put, and the
-    // caller was told the connections were preserved (#315). A tool must not
-    // claim work it does not do: refuse until the wire-carrying move exists
-    // (it needs #120's connectivity model to know which wires to stretch).
-    Ok(CallToolResult::error(
-        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
-    ))
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(reference) => reference.to_owned(),
+        Err(error) => return Ok(error),
+    };
+    let new_x = match require_f64(args, "x") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let new_y = match require_f64(args, "y") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
+
+    let before_source = read_consistent(&sch_path)?;
+    let mut target = match component_target_from_source(&sch_path, &before_source, &reference) {
+        Ok(target) => target,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let selected = target.uuids().into_iter().collect::<BTreeSet<_>>();
+    let before_signature = match connectivity_signature(&before_source) {
+        Ok(signature) => signature,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected cannot prove the original connectivity: {reason}"
+            )))
+        }
+    };
+    let before_pins = match selected_pin_positions(&before_source, &selected) {
+        Ok(pins) => pins,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected refused: {reason}"
+            )))
+        }
+    };
+    let before_cli = match kicad_cli_netlist_signature(&ctx.config.kicad_cli, &sch_path, None).await
+    {
+        Ok(signature) => signature,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected cannot obtain the required pre-move kicad-cli netlist: {reason}"
+            )))
+        }
+    };
+
+    let mut schematic = cse::Schematic::from_source(&sch_path, before_source.clone())?;
+    let anchor_uuid = &target.units[0].uuid;
+    let anchor = schematic
+        .symbols
+        .iter()
+        .find(|symbol| symbol.uuid == *anchor_uuid)
+        .expect("structural target UUID is present in the loaded schematic");
+    let (old_x, old_y) = anchor.position();
+    let (dx, dy) = (new_x - old_x, new_y - old_y);
+    for unit in &mut target.units {
+        unit.x = round6(unit.x + dx);
+        unit.y = round6(unit.y + dy);
+    }
+    for symbol in schematic
+        .symbols
+        .iter_mut()
+        .filter(|symbol| selected.contains(&symbol.uuid))
+    {
+        symbol.translate(dx, dy);
+    }
+    let carried = match carry_no_connects(&sch_path, &before_source, &mut schematic) {
+        Ok(carried) => carried,
+        Err(error) => return Ok(error),
+    };
+    let moved_source = schematic.to_source();
+    let after_pins = match selected_pin_positions(&moved_source, &selected) {
+        Ok(pins) => pins,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected refused: {reason}"
+            )))
+        }
+    };
+    if before_pins.keys().collect::<Vec<_>>() != after_pins.keys().collect::<Vec<_>>() {
+        return Ok(CallToolResult::error(
+            "move_connected refused: selected pin identities changed during the move",
+        ));
+    }
+    let pin_moves = before_pins
+        .iter()
+        .map(|(id, old)| (id.clone(), (*old, after_pins[id])))
+        .collect::<BTreeMap<_, _>>();
+    let (label_moved_source, labels_moved) = match move_attached_labels(moved_source, &pin_moves) {
+        Ok(result) => result,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected refused: {reason}"
+            )))
+        }
+    };
+    let bridges = match required_bridges(&before_source, &pin_moves) {
+        Ok(bridges) => bridges,
+        Err(reason) => {
+            return Ok(CallToolResult::error(format!(
+                "move_connected refused: {reason}"
+            )))
+        }
+    };
+
+    let mut selected_candidate = None;
+    let mut refusal_reasons = Vec::new();
+    for order in [BridgeOrder::HorizontalFirst, BridgeOrder::VerticalFirst] {
+        let (candidate, bridge_count) =
+            add_bridge_segments(label_moved_source.clone(), &bridges, order);
+        let candidate_signature = match connectivity_signature(&candidate) {
+            Ok(signature) => signature,
+            Err(reason) => {
+                refusal_reasons.push(format!("{order:?}: connectivity parse failed: {reason}"));
+                continue;
+            }
+        };
+        if candidate_signature != before_signature {
+            refusal_reasons.push(format!(
+                "{order:?}: pin/label connectivity partition changed"
+            ));
+            continue;
+        }
+        match remote_geometry_preserved(&before_source, &candidate, &selected, &pin_moves) {
+            Ok(true) => {}
+            Ok(false) => {
+                refusal_reasons.push(format!("{order:?}: existing remote geometry changed"));
+                continue;
+            }
+            Err(reason) => {
+                refusal_reasons.push(format!("{order:?}: preservation check failed: {reason}"));
+                continue;
+            }
+        }
+        let candidate_cli =
+            match kicad_cli_netlist_signature(&ctx.config.kicad_cli, &sch_path, Some(&candidate))
+                .await
+            {
+                Ok(signature) => signature,
+                Err(reason) => {
+                    refusal_reasons.push(format!("{order:?}: kicad-cli failed: {reason}"));
+                    continue;
+                }
+            };
+        if candidate_cli != before_cli {
+            refusal_reasons.push(format!("{order:?}: kicad-cli netlist changed"));
+            continue;
+        }
+        selected_candidate = Some((candidate, bridge_count, order));
+        break;
+    }
+    let Some((candidate, bridge_count, route_order)) = selected_candidate else {
+        return Ok(CallToolResult::error(format!(
+            "move_connected refused before writing because no orthogonal route preserved connectivity: {}",
+            refusal_reasons.join("; ")
+        )));
+    };
+
+    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    let moved_markers = match observed_no_connect_moves(&sch_path, "move_connected", &carried)? {
+        Ok(moved) => moved,
+        Err(error) => return Ok(error),
+    };
+    let observed = match load_component_mutation_readback(&sch_path, &target)? {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    let committed_source = match read_consistent(&sch_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(crate::tools::mutation_outcome_uncertain(
+                &sch_path,
+                "move_connected",
+                format!("the written schematic cannot be read back: {error}"),
+            ));
+        }
+    };
+    let committed_signature = connectivity_signature(&committed_source);
+    let committed_remote =
+        remote_geometry_preserved(&before_source, &committed_source, &selected, &pin_moves);
+    let committed_cli = kicad_cli_netlist_signature(&ctx.config.kicad_cli, &sch_path, None).await;
+    if committed_signature.as_ref() != Ok(&before_signature)
+        || committed_remote != Ok(true)
+        || committed_cli.as_ref() != Ok(&before_cli)
+    {
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &sch_path,
+            "move_connected",
+            format!(
+                "committed readback diverged: graph={:?}, remote={:?}, kicad_cli={:?}",
+                committed_signature, committed_remote, committed_cli
+            ),
+        ));
+    }
+
+    let mut result = json!({
+        "moved": observed["reference"],
+        "x": observed["x"],
+        "y": observed["y"],
+        "moved_units": observed["unit_count"],
+        "placements": observed["units"],
+        "bridges_added_count": bridge_count,
+        "bridge_route": format!("{route_order:?}"),
+        "labels_moved_count": labels_moved.len(),
+        "labels_moved": labels_moved,
+        "no_connects_moved_count": moved_markers.len(),
+        "no_connects_moved": moved_markers,
+        "connectivity_preserved": true,
+        "kicad_cli_netlist_preserved": true,
+        "remote_items_preserved": true
+    });
+    copy_component_observation(&mut result, &observed);
+    Ok(CallToolResult::json(&result))
 }
 
 async fn handle_move_region(
@@ -6288,40 +7058,534 @@ mod schematic_view_tests {
 mod move_connected_tests {
     use super::*;
 
-    /// #315: this tool silently delegated to the plain move since the first
-    /// release — symbol moved, wires stayed, success reported. Until the
-    /// wire-carrying move exists it must refuse, naming the alternative.
+    const TRACE: &str = include_str!("../../tests/fixtures/trace_point_kicad10.kicad_sch");
+    const NO_CONNECT_CARRY: &str =
+        include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+
+    fn context(cli: &std::path::Path) -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.kicad_sch");
+        // 바이트 그대로 복제한 공식 KiCad 10 fixture이며 직접 구조를 조작하지 않는다.
+        std::fs::write(&path, TRACE).unwrap();
+        let netlist = "(export (nets))";
+        let cli = crate::tools::cli::test_support::write_script(
+            directory.path(),
+            "fake-kicad-cli",
+            &format!(
+                "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; out=$1; fi\n  shift\ndone\nprintf '%s' '{}' > \"$out\"\n",
+                netlist
+            ),
+            "@echo off\r\nset out=\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif \"%1\"==\"--output\" (shift & set out=%1)\r\nshift\r\ngoto loop\r\n:done\r\n>\"%out%\" echo ^(export ^(nets^)^)\r\n",
+        );
+        (directory, path, cli)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn wire_map(source: &str) -> BTreeMap<String, (f64, f64, f64, f64)> {
+        let tree = parse_sexp(source).unwrap();
+        konnect_sexp::schematic::extract_wires(&tree)
+            .into_iter()
+            .map(|wire| {
+                (
+                    wire.uuid.expect("fixture wire UUID"),
+                    (wire.x1, wire.y1, wire.x2, wire.y2),
+                )
+            })
+            .collect()
+    }
+
+    fn component_positions(source: &str) -> BTreeMap<String, (f64, f64)> {
+        let tree = parse_sexp(source).unwrap();
+        extract_symbol_instances(&tree)
+            .into_iter()
+            .map(|item| (item.reference, (item.x, item.y)))
+            .collect()
+    }
+
+    #[test]
+    fn move_connected_schema_restores_the_four_operational_arguments() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "move_connected")
+            .unwrap();
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["schematic", "reference", "x", "y"])
+        );
+        assert!(!tool.description.contains("REFUSED until implemented"));
+    }
+
+    /// 기존 wire와 원격 심볼은 그대로 두고 선택 심볼에서 기존 접속점까지
+    /// 직교 bridge를 추가해야 한다. 단순 wire endpoint translate는 이 검증을 못 지난다.
     #[tokio::test]
-    async fn move_connected_refuses_instead_of_faking_success() {
+    async fn move_connected_stretches_locally_and_keeps_remote_geometry_fixed() {
+        let (_directory, path, cli) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let before_wires = wire_map(&before);
+        let before_components = component_positions(&before);
         let result = handle_move_connected(
             &serde_json::json!({
-                "schematic": "unused.kicad_sch",
-                "reference": "R1", "x": 10.0, "y": 10.0
+                "schematic": path,
+                "reference": "R1", "x": 110.49, "y": 105.41
             }),
-            &crate::tools::ToolContext::new(
-                crate::tools::ServerConfig {
-                    kicad_cli: String::new(),
-                    kicad_binary: String::new(),
-                    ipc_address: String::new(),
-                    project_dir: None,
-                    jlcpcb_db_path: None,
-                    auto_load_toolsets: false,
-                    eager_toolsets: false,
-                },
-                std::sync::Arc::new(crate::router::ToolRouter::new()),
-            ),
+            &context(&cli),
         )
         .await
         .unwrap();
 
-        assert!(result.is_error);
-        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
-            panic!("expected text");
-        };
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["moved"], "R1", "{response}");
+        assert_eq!(response["connectivity_preserved"], true, "{response}");
+        assert_eq!(response["remote_items_preserved"], true, "{response}");
         assert!(
-            text.contains("move_schematic_component"),
-            "must name the working alternative: {text}"
+            response["bridges_added_count"].as_u64().unwrap_or(0) >= 2,
+            "{response}"
         );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let after_wires = wire_map(&after);
+        for (uuid, endpoints) in &before_wires {
+            assert_eq!(
+                after_wires.get(uuid),
+                Some(endpoints),
+                "remote wire {uuid} moved"
+            );
+        }
+        let after_components = component_positions(&after);
+        assert_eq!(after_components["R1"], (110.49, 105.41));
+        for (reference, position) in before_components {
+            if reference != "R1" {
+                assert_eq!(
+                    after_components[&reference], position,
+                    "remote {reference} moved"
+                );
+            }
+        }
+        for wire in konnect_sexp::schematic::extract_wires(&parse_sexp(&after).unwrap()) {
+            assert!(
+                (wire.x1 - wire.x2).abs() < 0.01 || (wire.y1 - wire.y2).abs() < 0.01,
+                "diagonal wire written: {wire:?}"
+            );
+        }
+    }
+
+    /// 존재하지 않는 reference는 원자적으로 거부해 원본 바이트를 보존한다.
+    #[tokio::test]
+    async fn move_connected_missing_target_preserves_original_bytes() {
+        let (_directory, path, cli) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_connected(
+            &json!({"schematic": path, "reference": "NO_SUCH", "x": 10.16, "y": 10.16}),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// wire 없이 좌표만 공유하는 두 pin도 KiCad에서는 한 net이다. 한쪽 심볼만
+    /// 움직일 때 old point와 new pin을 bridge해 remote stacked pin을 고정한다.
+    #[tokio::test]
+    async fn move_connected_preserves_a_stacked_remote_pin() {
+        let (_directory, path, cli) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let before_components = component_positions(&before);
+        let r2 = before_components["R2"];
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R2",
+                "x": r2.0 + 10.16,
+                "y": r2.1 + 5.08
+            }),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["connectivity_preserved"], true, "{response}");
+        assert!(
+            response["bridges_added_count"].as_u64().unwrap_or(0) >= 1,
+            "{response}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let after_components = component_positions(&after);
+        assert_eq!(after_components["R3"], before_components["R3"]);
+        assert_eq!(wire_map(&after).len(), wire_map(&before).len() + 2);
+    }
+
+    /// multi-unit reference는 최저 unit을 새 좌표에 두고 모든 다른 unit을 같은
+    /// delta로 옮긴다. 각 unit/pin occurrence identity는 그대로 유지한다.
+    #[tokio::test]
+    async fn move_connected_translates_every_unit_by_one_delta() {
+        let (_directory, path, cli) = fixture();
+        let before = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let before_units = extract_symbol_instances(&before)
+            .into_iter()
+            .filter(|item| item.reference == "U1")
+            .map(|item| (item.unit, (item.x, item.y)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(before_units.len(), 2);
+        let anchor = before_units[&1];
+        let destination = (anchor.0 + 10.16, anchor.1 + 5.08);
+
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "U1",
+                "x": destination.0,
+                "y": destination.1
+            }),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["moved_units"], 2, "{response}");
+
+        let after = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let after_units = extract_symbol_instances(&after)
+            .into_iter()
+            .filter(|item| item.reference == "U1")
+            .map(|item| (item.unit, (item.x, item.y)))
+            .collect::<BTreeMap<_, _>>();
+        for (unit, before_position) in before_units {
+            let after_position = after_units[&unit];
+            assert_eq!(
+                (
+                    round6(after_position.0 - before_position.0),
+                    round6(after_position.1 - before_position.1)
+                ),
+                (10.16, 5.08)
+            );
+        }
+    }
+
+    /// no-connect는 pin의 의도이므로 connected move에서도 같은 pin occurrence를
+    /// 따라가며, wire bridge를 만들어 그 pin을 연결하면 안 된다.
+    #[tokio::test]
+    async fn move_connected_carries_no_connect_without_inventing_a_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("carry.kicad_sch");
+        std::fs::write(&path, NO_CONNECT_CARRY).unwrap();
+        let cli = crate::tools::cli::test_support::write_script(
+            directory.path(),
+            "fake-kicad-cli",
+            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; out=$1; fi\n  shift\ndone\nprintf '%s' '(export (nets))' > \"$out\"\n",
+            "@echo off\r\nset out=\r\n:loop\r\nif \"%1\"==\"\" goto done\r\nif \"%1\"==\"--output\" (shift & set out=%1)\r\nshift\r\ngoto loop\r\n:done\r\n>\"%out%\" echo ^(export ^(nets^)^)\r\n",
+        );
+        let before_wire_count = wire_map(NO_CONNECT_CARRY).len();
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R2",
+                "x": 154.94,
+                "y": 163.83
+            }),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["no_connects_moved_count"], 1, "{response}");
+        assert_eq!(response["bridges_added_count"], 0, "{response}");
+        assert_eq!(
+            wire_map(&std::fs::read_to_string(&path).unwrap()).len(),
+            before_wire_count
+        );
+    }
+
+    /// 직접 pin 위에 놓인 label은 pin과 함께 이동하지만, 원격 wire endpoint는
+    /// 그대로 남고 bridge를 통해 같은 net에 계속 속해야 한다.
+    #[tokio::test]
+    async fn move_connected_carries_a_directly_attached_label() {
+        let (_directory, path, cli) = fixture();
+        let context = std::sync::Arc::new(context(&cli));
+        let add_label = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .find(|tool| tool.name == "add_schematic_net_label")
+            .unwrap();
+        let added = (add_label.handler)(
+            &json!({
+                "schematic": path,
+                "net": "DIRECT_MOVE",
+                "x": 100.33,
+                "y": 104.14,
+                "label_type": "net_label"
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!added.is_error, "{added:?}");
+
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "x": 110.49,
+                "y": 105.41
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["labels_moved_count"], 1, "{response}");
+
+        let after = parse_sexp(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let label = extract_labels(&after)
+            .into_iter()
+            .find(|label| label.net == "DIRECT_MOVE")
+            .expect("moved label");
+        assert_eq!((label.x, label.y), (110.49, 109.22));
+    }
+
+    /// 두 직교 elbow 후보가 각각 다른 기존 label을 통과해 net을 합치면 어느
+    /// 경로도 고르지 않고 쓰기 전 원본 바이트를 보존한다.
+    #[tokio::test]
+    async fn move_connected_refuses_when_both_elbows_would_merge_nets() {
+        let (_directory, path, cli) = fixture();
+        let context = std::sync::Arc::new(context(&cli));
+        let add_label = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .find(|tool| tool.name == "add_schematic_net_label")
+            .unwrap();
+        let add_wire = crate::tools::sch_wiring::tools()
+            .into_iter()
+            .find(|tool| tool.name == "add_wire")
+            .unwrap();
+        for (net, x1, y1, x2, y2) in [
+            ("BLOCK_HORIZONTAL", 115.57, 96.52, 125.73, 96.52),
+            ("BLOCK_VERTICAL", 100.33, 106.68, 90.17, 106.68),
+        ] {
+            let wired = (add_wire.handler)(
+                &json!({
+                    "schematic": path,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2
+                }),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!wired.is_error, "{wired:?}");
+            let added = (add_label.handler)(
+                &json!({
+                    "schematic": path,
+                    "net": net,
+                    "x": x2,
+                    "y": y2,
+                    "label_type": "net_label"
+                }),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(!added.is_error, "{added:?}");
+        }
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "x": 115.57,
+                "y": 110.49
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text: {result:?}");
+        };
+        assert!(text.contains("no orthogonal route"), "{text}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// 첫 elbow가 다른 named net을 합치지만 두 번째가 안전하면 안전한 후보를
+    /// 선택하고 기존 remote wire는 그대로 둔다.
+    #[tokio::test]
+    async fn move_connected_uses_the_alternate_safe_elbow() {
+        let (_directory, path, cli) = fixture();
+        let context = std::sync::Arc::new(context(&cli));
+        let wiring = crate::tools::sch_wiring::tools();
+        let add_wire = wiring.iter().find(|tool| tool.name == "add_wire").unwrap();
+        let add_label = wiring
+            .iter()
+            .find(|tool| tool.name == "add_schematic_net_label")
+            .unwrap();
+        let wired = (add_wire.handler)(
+            &json!({
+                "schematic": path,
+                "x1": 115.57,
+                "y1": 96.52,
+                "x2": 125.73,
+                "y2": 96.52
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!wired.is_error, "{wired:?}");
+        let labelled = (add_label.handler)(
+            &json!({
+                "schematic": path,
+                "net": "BLOCK_HORIZONTAL",
+                "x": 125.73,
+                "y": 96.52,
+                "label_type": "net_label"
+            }),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!labelled.is_error, "{labelled:?}");
+        let before_wires = wire_map(&std::fs::read_to_string(&path).unwrap());
+
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "x": 115.57,
+                "y": 110.49
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["bridge_route"], "VerticalFirst", "{response}");
+        let after_wires = wire_map(&std::fs::read_to_string(&path).unwrap());
+        for (uuid, endpoints) in before_wires {
+            assert_eq!(after_wires.get(&uuid), Some(&endpoints));
+        }
+    }
+
+    /// 내부 graph가 같더라도 KiCad CLI가 다른 netlist를 내면 성공시키지 않는다.
+    /// candidate 임시 파일에서만 다른 net을 내는 fake CLI로 독립 guard를 고정한다.
+    #[tokio::test]
+    async fn move_connected_refuses_a_kicad_cli_netlist_difference_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.kicad_sch");
+        std::fs::write(&path, TRACE).unwrap();
+        let cli = crate::tools::cli::test_support::write_script(
+            directory.path(),
+            "different-netlist-cli",
+            r#"#!/bin/sh
+out=''
+candidate=no
+for argument in "$@"; do
+  if [ "$previous" = "--output" ]; then out=$argument; fi
+  case "$argument" in *.konnect-move-connected-*.kicad_sch) candidate=yes;; esac
+  previous=$argument
+done
+if [ "$candidate" = yes ]; then name='/CHANGED'; else name='/ORIGINAL'; fi
+printf '(export (nets (net (code "1") (name "%s") (node (ref "R1") (pin "1")))))' "$name" > "$out"
+"#,
+            r#"@echo off
+set out=
+set previous=
+set name=/ORIGINAL
+:loop
+if "%1"=="" goto done
+if "%previous%"=="--output" set out=%1
+echo %1| findstr /C:".konnect-move-connected-" >nul && set name=/CHANGED
+set previous=%1
+shift
+goto loop
+:done
+>"%out%" echo ^(export ^(nets ^(net ^(code "1"^) ^(name "%name%"^) ^(node ^(ref "R1"^) ^(pin "1"^)^)^)^)^)
+"#,
+        );
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "x": 110.49,
+                "y": 105.41
+            }),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text: {result:?}");
+        };
+        assert!(text.contains("kicad-cli netlist changed"), "{text}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// 호스트에 설치된 KiCad CLI가 있을 때만 명시 실행하는 독립 netlist 증거다.
+    /// handler 내부 비교와 별도로 test가 전후 export를 다시 읽는다.
+    #[tokio::test]
+    #[ignore = "requires installed KiCad 10 CLI"]
+    async fn move_connected_preserves_actual_kicad_cli_netlist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.kicad_sch");
+        std::fs::write(&path, TRACE).unwrap();
+        let cli = std::env::var("KONNECT_TEST_KICAD_CLI")
+            .unwrap_or_else(|_| "/usr/local/bin/kicad-cli".to_string());
+        let before_wires = wire_map(TRACE);
+        let before = kicad_cli_netlist_signature(&cli, &path, None)
+            .await
+            .expect("pre-move KiCad netlist");
+
+        let result = handle_move_connected(
+            &json!({
+                "schematic": path,
+                "reference": "R1",
+                "x": 110.49,
+                "y": 105.41
+            }),
+            &context(std::path::Path::new(&cli)),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = kicad_cli_netlist_signature(&cli, &path, None)
+            .await
+            .expect("post-move KiCad netlist");
+        assert_eq!(after, before);
+        let after_wires = wire_map(&std::fs::read_to_string(&path).unwrap());
+        for (uuid, endpoints) in before_wires {
+            assert_eq!(after_wires.get(&uuid), Some(&endpoints));
+        }
     }
 }
 

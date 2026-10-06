@@ -1,5 +1,3 @@
-# Tauri regenerates gen/schemas on every build; tracking them caused
-# repeated add/delete churn across contributor PRs (removed, restored in
-# #44's merge, removed again via an interim merge). Build artifacts, not
-# source.
-/gen/
+# Standalone viewer build output. The repository root also ignores `target`,
+# but this crate is an excluded workspace with its own target directory.
+/target/

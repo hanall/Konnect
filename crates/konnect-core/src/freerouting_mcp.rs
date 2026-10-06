@@ -28,9 +28,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
+const DISABLE_ANALYTICS_ENV: (&str, &str) = (
+    "FREEROUTING__USAGE_AND_DIAGNOSTIC_DATA__DISABLE_ANALYTICS",
+    "true",
+);
 
 fn server_arguments() -> &'static [&'static str] {
     &[
+        "--usage_and_diagnostic_data.disable_analytics=true",
         "--api_server.enabled=true",
         "--api_server.authentication.enabled=false",
         "--api_server-endpoints=http://127.0.0.1:37864",
@@ -40,6 +45,28 @@ fn server_arguments() -> &'static [&'static str] {
         "--mcp_server.stdio=true",
         "--gui.enabled=false",
     ]
+}
+
+fn local_mcp_command(jar: &Path) -> Command {
+    let mut command = Command::new("java");
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+    {
+        let mut property = std::ffi::OsString::from("-Duser.home=");
+        property.push(home);
+        command.arg(property);
+    }
+    command
+        .arg("-jar")
+        .arg(jar)
+        .args(server_arguments())
+        .env(DISABLE_ANALYTICS_ENV.0, DISABLE_ANALYTICS_ENV.1)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
 }
 
 const REQUIRED_TOOLS: &[&str] = &[
@@ -470,15 +497,7 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path) -> Result<Self> {
-        let mut command = Command::new("java");
-        command
-            .arg("-jar")
-            .arg(jar)
-            .args(server_arguments())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = local_mcp_command(jar);
         let mut child = command
             .spawn()
             .context("start local Freerouting MCP server")?;
@@ -838,6 +857,7 @@ mod tests {
     #[test]
     fn unauthenticated_servers_are_forced_to_loopback() {
         let arguments = server_arguments();
+        assert!(arguments.contains(&"--usage_and_diagnostic_data.disable_analytics=true"));
         assert!(arguments.contains(&"--api_server.authentication.enabled=false"));
         assert!(arguments.contains(&"--api_server-endpoints=http://127.0.0.1:37864"));
         assert!(arguments.contains(&"--mcp_server.authentication.enabled=false"));
@@ -845,6 +865,37 @@ mod tests {
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn child_environment_forces_analytics_off() {
+        let command = local_mcp_command(Path::new("freerouting.jar"));
+        let forced = command.as_std().get_envs().any(|(name, value)| {
+            name == DISABLE_ANALYTICS_ENV.0 && value.is_some_and(|value| value == "true")
+        });
+        assert!(forced, "Freerouting child lost the analytics-off override");
+    }
+
+    #[test]
+    fn child_jvm_user_home_is_bound_to_the_process_home() {
+        let expected_home = std::env::var_os("HOME").expect("test process has HOME");
+        let expected =
+            std::ffi::OsString::from(format!("-Duser.home={}", expected_home.to_string_lossy()));
+        let command = local_mcp_command(Path::new("freerouting.jar"));
+        let arguments = command.as_std().get_args().collect::<Vec<_>>();
+        assert!(
+            arguments.contains(&expected.as_os_str()),
+            "Freerouting JVM user.home can escape the wrapper HOME: {arguments:?}"
+        );
+        let jar = arguments
+            .iter()
+            .position(|argument| *argument == "-jar")
+            .expect("java command carries -jar");
+        let home = arguments
+            .iter()
+            .position(|argument| *argument == expected.as_os_str())
+            .expect("java command carries user.home");
+        assert!(home < jar, "JVM properties must precede -jar");
     }
 
     #[test]

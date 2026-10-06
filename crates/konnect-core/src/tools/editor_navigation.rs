@@ -8,12 +8,13 @@
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{invalid_arg, opt_str, require_array, require_str, ToolContext, ToolDef};
+use anyhow::Context;
 use konnect_ipc::{
     IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
     IpcSelectionMutationErrorKind, IpcSelectionObservationErrorKind, IpcSheetInstancePath,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use super::cross_probe::{resolve_cross_probe, CrossProbeError, CrossProbeRequest};
 use super::navigation_target::{
@@ -93,7 +94,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "resolve_cross_probe_target",
-            "Resolve an exact schematic-symbol/PCB-footprint relationship in either direction from stable saved KiCad symbol-path linkage, while proving both explicit live document contexts. This resolve-only operation does not activate or select; pin/pad/net expansion remains unsupported unless a unique stable destination can be modeled.",
+            "Resolve an exact schematic-symbol/PCB-footprint relationship in either direction \
+             from stable saved KiCad symbol-path linkage. By default both live document contexts \
+             must be exact. Manager endpoints that expose only an unbound schematic basename are \
+             refused unless allow_saved_schematic_context=true; that explicit root-only mode keeps \
+             the PCB live-bound, labels schematic authority as saved_file, and revision-binds both \
+             saved documents before and after observation. This resolve-only operation never \
+             activates or selects.",
             json!({
                 "type": "object",
                 "properties": {
@@ -104,7 +111,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "pcb_document_path": { "type": "string" },
                     "schematic_sheet_instance_path": { "type": "array", "items": { "type": "string" } },
                     "sheet_path_human_readable": { "type": "string" },
-                    "source_object_kiid": { "type": "string" }
+                    "source_object_kiid": { "type": "string" },
+                    "allow_saved_schematic_context": { "type": "boolean", "default": false, "description": "Explicitly allow root-only saved schematic authority when a manager exposes only an unbound schematic BoardFilename. Never used by selection or mutation tools." }
                 },
                 "required": ["source_editor", "project_name", "project_path", "schematic_document_path", "pcb_document_path", "schematic_sheet_instance_path", "source_object_kiid"]
             }),
@@ -707,10 +715,141 @@ fn selection_mutation_error_result(error: anyhow::Error) -> CallToolResult {
     }
 }
 
+fn canonical(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    std::fs::canonicalize(path).with_context(|| format!("resolve {label} {}", path.display()))
+}
+
+fn native_basename(
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+) -> Option<&str> {
+    use konnect_ipc::gen::kiapi::common::types::document_specifier::Identifier;
+    let Identifier::BoardFilename(filename) = document.identifier.as_ref()? else {
+        return None;
+    };
+    let mut components = Path::new(filename).components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    name.to_str()
+}
+
+fn saved_root_uuid(path: &Path) -> anyhow::Result<String> {
+    let source = std::fs::read_to_string(path)?;
+    let root = konnect_sexp::parse_sexp(&source).context("parse root schematic")?;
+    root.find_str("uuid")
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string)
+        .context("root schematic has no UUID")
+}
+
+fn saved_manager_root_schematic_evidence(
+    client: &konnect_ipc::KiCadIpcClient,
+    request: &CrossProbeRequest,
+) -> anyhow::Result<serde_json::Value> {
+    use konnect_ipc::gen::kiapi::common::types::DocumentType;
+
+    if request.schematic_sheet_instance_path.kiids.len() != 1 {
+        anyhow::bail!("saved schematic context opt-in supports only the root schematic instance");
+    }
+    let project_dir = canonical(Path::new(&request.project.path), "project directory")?;
+    let project_file = canonical(
+        &project_dir.join(format!("{}.kicad_pro", request.project.name)),
+        "project file",
+    )?;
+    let schematic = canonical(&request.schematic_document_path, "schematic")?;
+    let pcb = canonical(&request.pcb_document_path, "board")?;
+    let expected_schematic = canonical(
+        &project_dir.join(format!("{}.kicad_sch", request.project.name)),
+        "canonical sibling schematic",
+    )?;
+    let expected_pcb = canonical(
+        &project_dir.join(format!("{}.kicad_pcb", request.project.name)),
+        "canonical sibling board",
+    )?;
+    if schematic != expected_schematic || pcb != expected_pcb {
+        anyhow::bail!("manager root adapter requires canonical same-stem project siblings");
+    }
+
+    let schematic_documents = client.get_open_documents_for(IpcEditorKind::Schematic)?;
+    let expected_basename = schematic
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("schematic basename is not UTF-8")?;
+    let matching_schematic = schematic_documents
+        .iter()
+        .filter(|document| {
+            document.r#type == DocumentType::DoctypeSchematic as i32
+                && native_basename(document) == Some(expected_basename)
+        })
+        .collect::<Vec<_>>();
+    if matching_schematic.len() != 1 {
+        anyhow::bail!(
+            "saved schematic context opt-in needs one manager basename observation, observed {}",
+            matching_schematic.len()
+        );
+    }
+    if let Some(project) = matching_schematic[0].project.as_ref() {
+        if project.name != request.project.name
+            || canonical(Path::new(&project.path), "live schematic project")? != project_dir
+        {
+            anyhow::bail!("manager schematic response names a different project");
+        }
+    }
+
+    let root_uuid = saved_root_uuid(&schematic)?;
+    if request.schematic_sheet_instance_path.kiids != [root_uuid.clone()] {
+        anyhow::bail!("requested root sheet KIID does not match the canonical sibling schematic");
+    }
+    let native_project = matching_schematic[0]
+        .project
+        .as_ref()
+        .map(|project| json!({"name": project.name, "path": project.path}));
+    Ok(json!({
+        "schematic_context_authority": "saved_file",
+        "live_schematic_exact": false,
+        "native_observation": {
+            "document_type": "DOCTYPE_SCHEMATIC",
+            "identifier_kind": "BoardFilename",
+            "basename": expected_basename,
+            "project_in_response": native_project,
+            "authority": "basename_only_unbound",
+        },
+        "saved_context": {
+            "project_file": project_file,
+            "schematic": schematic,
+            "pcb": pcb,
+            "root_kiid": root_uuid,
+            "canonical_sibling": true,
+        }
+    }))
+}
+
+fn cross_probe_revision(path: &Path) -> anyhow::Result<(Vec<u8>, String)> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    Ok((bytes, sha256))
+}
+
 async fn handle_resolve_cross_probe_target(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let allow_saved_schematic_context = match args.get("allow_saved_schematic_context") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_arg(
+                    "allow_saved_schematic_context",
+                    "must be a boolean",
+                ))
+            }
+        },
+    };
     let request = match parse_cross_probe_request(args) {
         Ok(request) => request,
         Err(result) => return Ok(result),
@@ -720,35 +859,98 @@ async fn handle_resolve_cross_probe_target(
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (schematic_before, schematic_sha256) =
+            cross_probe_revision(&request.schematic_document_path)?;
+        let (pcb_before, pcb_sha256) = cross_probe_revision(&request.pcb_document_path)?;
         let resolution = resolve_cross_probe(&request)?;
-        let source_live = live_cross_probe_document(&request, request.source_editor);
-        let destination_editor = match request.source_editor {
-            IpcEditorKind::Schematic => IpcEditorKind::Pcb,
-            IpcEditorKind::Pcb => IpcEditorKind::Schematic,
-        };
-        let destination_live = live_cross_probe_document(&request, destination_editor);
         let client = konnect_ipc::KiCadIpcClient::new(address);
-        let source_observed = client.observe_exact_open_document(&source_live)?;
-        let destination_observed = client.observe_exact_open_document(&destination_live)?;
-        Ok((resolution, source_observed, destination_observed))
+        let pcb_live = client.observe_exact_open_document(&live_cross_probe_document(
+            &request,
+            IpcEditorKind::Pcb,
+        ))?;
+        let requested_schematic = live_cross_probe_document(&request, IpcEditorKind::Schematic);
+        let (schematic_live, schematic_evidence) =
+            match client.observe_exact_open_document(&requested_schematic) {
+                Ok(document) => (
+                    Some(document),
+                    json!({
+                        "schematic_context_authority": "live_exact",
+                        "live_schematic_exact": true,
+                        "source": "kicad_ipc_get_open_documents"
+                    }),
+                ),
+                Err(direct_error) if allow_saved_schematic_context => {
+                    let mut evidence = saved_manager_root_schematic_evidence(&client, &request)?;
+                    evidence["direct_live_refusal"] = json!(format!("{direct_error:#}"));
+                    (None, evidence)
+                }
+                Err(error) => return Err(error),
+            };
+
+        let (schematic_after, schematic_after_sha256) =
+            cross_probe_revision(&request.schematic_document_path)?;
+        let (pcb_after, pcb_after_sha256) = cross_probe_revision(&request.pcb_document_path)?;
+        if schematic_before != schematic_after || pcb_before != pcb_after {
+            anyhow::bail!("saved cross-probe documents changed during live-context observation");
+        }
+        let resolution_after = resolve_cross_probe(&request)?;
+        if resolution_after != resolution {
+            anyhow::bail!("cross-probe resolution changed during live-context observation");
+        }
+        let source_document = match request.source_editor {
+            IpcEditorKind::Pcb => Some(pcb_live.clone()),
+            IpcEditorKind::Schematic => schematic_live.clone(),
+        };
+        let destination_document = match request.source_editor {
+            IpcEditorKind::Pcb => schematic_live.clone(),
+            IpcEditorKind::Schematic => Some(pcb_live.clone()),
+        };
+        Ok((
+            resolution,
+            source_document,
+            destination_document,
+            pcb_live,
+            schematic_evidence,
+            schematic_sha256,
+            schematic_after_sha256,
+            pcb_sha256,
+            pcb_after_sha256,
+        ))
     })
     .await?;
     match result {
-        Ok((resolution, source_observed, destination_observed)) => {
-            Ok(CallToolResult::json(&json!({
-                "resolution": resolution,
-                "live_context_evidence": {
-                    "source": "kicad_ipc_get_open_documents",
-                    "source_document": source_observed,
-                    "destination_document": destination_observed
-                },
-                "destination_navigation": {
-                    "attempted": false,
-                    "status": "not_attempted",
-                    "reason": "exact activation/reveal is unsupported by the bundled stable protocol; resolution does not imply a state change"
+        Ok((
+            resolution,
+            source_document,
+            destination_document,
+            pcb_live,
+            schematic_evidence,
+            schematic_sha256,
+            schematic_after_sha256,
+            pcb_sha256,
+            pcb_after_sha256,
+        )) => Ok(CallToolResult::json(&json!({
+            "resolution": resolution,
+            "live_context_evidence": {
+                "source": "exact_live_pcb_with_explicit_schematic_context_authority",
+                "source_document": source_document,
+                "destination_document": destination_document,
+                "pcb_document": pcb_live,
+                "schematic_context": schematic_evidence,
+                "saved_revision_binding": {
+                    "schematic_sha256_before": schematic_sha256,
+                    "schematic_sha256_after": schematic_after_sha256,
+                    "pcb_sha256_before": pcb_sha256,
+                    "pcb_sha256_after": pcb_after_sha256,
+                    "unchanged": true
                 }
-            })))
-        }
+            },
+            "destination_navigation": {
+                "attempted": false,
+                "status": "not_attempted",
+                "reason": "exact activation/reveal is unsupported by the bundled stable protocol; resolution does not imply a state change"
+            }
+        }))),
         Err(error) => Ok(cross_probe_error_result(error)),
     }
 }
@@ -1225,6 +1427,125 @@ mod tests {
         url
     }
 
+    fn spawn_manager_board_filename_mock(
+        project_path: String,
+        extra_project_path: Option<String>,
+        schematic_has_project: bool,
+        duplicate_schematic: bool,
+        requests: usize,
+    ) -> String {
+        spawn_manager_board_filename_mock_with_mutation(
+            project_path,
+            extra_project_path,
+            schematic_has_project,
+            duplicate_schematic,
+            requests,
+            None,
+        )
+    }
+
+    fn spawn_manager_board_filename_mock_with_mutation(
+        project_path: String,
+        extra_project_path: Option<String>,
+        schematic_has_project: bool,
+        duplicate_schematic: bool,
+        requests: usize,
+        mutate_schematic_after_first_response: Option<(PathBuf, Vec<u8>)>,
+    ) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://manager-cross-probe-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock socket");
+        socket.listen(&url).expect("listen");
+        std::thread::spawn(move || {
+            for request_index in 0..requests {
+                let message = socket.recv().expect("request");
+                let request =
+                    kiapi::common::ApiRequest::decode(message.as_slice()).expect("decode request");
+                let command = request.message.expect("command");
+                let query =
+                    kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                        .expect("open documents");
+                let documents = if query.r#type
+                    == kiapi::common::types::DocumentType::DoctypeSchematic as i32
+                {
+                    let document = kiapi::common::types::DocumentSpecifier {
+                        r#type: query.r#type,
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                "nav.kicad_sch".to_string(),
+                            ),
+                        ),
+                        project: schematic_has_project.then(|| {
+                            kiapi::common::types::ProjectSpecifier {
+                                name: "nav".to_string(),
+                                path: project_path.clone(),
+                            }
+                        }),
+                    };
+                    if duplicate_schematic {
+                        vec![document.clone(), document]
+                    } else {
+                        vec![document]
+                    }
+                } else {
+                    let mut documents = vec![kiapi::common::types::DocumentSpecifier {
+                        r#type: query.r#type,
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                "nav.kicad_pcb".to_string(),
+                            ),
+                        ),
+                        project: Some(kiapi::common::types::ProjectSpecifier {
+                            name: "nav".to_string(),
+                            path: project_path.clone(),
+                        }),
+                    }];
+                    if let Some(extra) = &extra_project_path {
+                        documents.push(kiapi::common::types::DocumentSpecifier {
+                            r#type: query.r#type,
+                            identifier: Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    "nav.kicad_pcb".to_string(),
+                                ),
+                            ),
+                            project: Some(kiapi::common::types::ProjectSpecifier {
+                                name: "nav".to_string(),
+                                path: extra.clone(),
+                            }),
+                        });
+                    }
+                    documents
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: Some(builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )),
+                };
+                socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .expect("response");
+                if request_index == 0 {
+                    if let Some((path, replacement)) =
+                        mutate_schematic_after_first_response.as_ref()
+                    {
+                        std::fs::write(path, replacement)
+                            .expect("mutate saved schematic between live observations");
+                    }
+                }
+            }
+        });
+        url
+    }
+
     #[test]
     fn public_tool_is_read_only_and_takes_no_required_arguments() {
         let definitions = tools();
@@ -1623,6 +1944,230 @@ mod tests {
         assert!(commands
             .iter()
             .all(|command| command.ends_with("GetOpenDocuments")));
+    }
+
+    #[tokio::test]
+    async fn manager_board_filename_requires_explicit_saved_root_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let schematic = temp.path().join("nav.kicad_sch");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch (uuid \"root\") \
+             (symbol (lib_id \"Device:C\") (at 1 2) (uuid \"sym-c10\") \
+               (property \"Reference\" \"C10\") \
+               (instances (project \"nav\" (path \"/root\" (reference \"C10\") (unit 1))))) \
+             (sheet_instances (path \"/\" (page \"1\"))))",
+        )
+        .unwrap();
+        let board = temp.path().join("nav.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\") (path \"/sym-c10\")))",
+        )
+        .unwrap();
+        let project_path = temp.path().display().to_string();
+        let strict = handle_resolve_cross_probe_target(
+            &json!({
+                "source_editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "schematic_document_path": schematic.display().to_string(),
+                "pcb_document_path": board.display().to_string(),
+                "schematic_sheet_instance_path": ["root"],
+                "source_object_kiid": "fp-c10"
+            }),
+            &context(spawn_manager_board_filename_mock(
+                project_path.clone(),
+                None,
+                false,
+                false,
+                2,
+            )),
+        )
+        .await
+        .expect("strict handler result");
+        assert!(
+            strict.is_error,
+            "manager basename must be refused by default"
+        );
+
+        let result = handle_resolve_cross_probe_target(
+            &json!({
+                "source_editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "schematic_document_path": schematic,
+                "pcb_document_path": board,
+                "schematic_sheet_instance_path": ["root"],
+                "source_object_kiid": "fp-c10",
+                "allow_saved_schematic_context": true
+            }),
+            &context(spawn_manager_board_filename_mock(
+                project_path,
+                None,
+                false,
+                false,
+                3,
+            )),
+        )
+        .await
+        .expect("handler result");
+
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["live_context_evidence"]["schematic_context"]["schematic_context_authority"],
+            "saved_file"
+        );
+        assert_eq!(
+            body["live_context_evidence"]["schematic_context"]["native_observation"]
+                ["identifier_kind"],
+            "BoardFilename"
+        );
+        assert_eq!(
+            body["live_context_evidence"]["schematic_context"]["saved_context"]["root_kiid"],
+            "root"
+        );
+        assert_eq!(
+            body["live_context_evidence"]["schematic_context"]["live_schematic_exact"],
+            false
+        );
+        assert_eq!(
+            body["live_context_evidence"]["saved_revision_binding"]["unchanged"],
+            true
+        );
+        assert!(
+            !body["live_context_evidence"]["source_document"].is_null(),
+            "the PCB source has an exact live document"
+        );
+        assert!(
+            body["live_context_evidence"]["destination_document"].is_null(),
+            "saved schematic authority must not be promoted to an exact live document"
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_root_authority_refuses_semantically_equal_schematic_byte_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nav.kicad_pro"), "{}").unwrap();
+        let schematic = temp.path().join("nav.kicad_sch");
+        let schematic_before = "(kicad_sch (uuid \"root\") \
+             (symbol (lib_id \"Device:C\") (at 1 2) (uuid \"sym-c10\") \
+               (property \"Reference\" \"C10\") \
+               (instances (project \"nav\" (path \"/root\" (reference \"C10\") (unit 1))))) \
+             (sheet_instances (path \"/\" (page \"1\"))))";
+        std::fs::write(&schematic, schematic_before).unwrap();
+        let board = temp.path().join("nav.kicad_pcb");
+        let board_before = "(kicad_pcb (footprint \"Capacitor:C\" (layer \"F.Cu\") (at 1 2) \
+             (uuid \"fp-c10\") (property \"Reference\" \"C10\") (path \"/sym-c10\")))";
+        std::fs::write(&board, board_before).unwrap();
+        let project_path = temp.path().display().to_string();
+        let schematic_after = format!("{schematic_before}\n").into_bytes();
+        let result = handle_resolve_cross_probe_target(
+            &json!({
+                "source_editor": "pcb",
+                "project_name": "nav",
+                "project_path": project_path.clone(),
+                "schematic_document_path": schematic.display().to_string(),
+                "pcb_document_path": board.display().to_string(),
+                "schematic_sheet_instance_path": ["root"],
+                "source_object_kiid": "fp-c10",
+                "allow_saved_schematic_context": true
+            }),
+            &context(spawn_manager_board_filename_mock_with_mutation(
+                project_path,
+                None,
+                false,
+                false,
+                3,
+                Some((schematic.clone(), schematic_after.clone())),
+            )),
+        )
+        .await
+        .expect("handler result");
+
+        assert!(result.is_error, "saved byte drift cannot produce a mapping");
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read(&schematic).unwrap(), schematic_after);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), board_before);
+    }
+
+    #[test]
+    fn manager_adapter_refuses_hierarchy_and_ambiguous_project_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        for directory in [temp.path(), extra.path()] {
+            std::fs::write(directory.join("nav.kicad_pro"), "{}").unwrap();
+            std::fs::write(
+                directory.join("nav.kicad_sch"),
+                "(kicad_sch (uuid \"root\"))",
+            )
+            .unwrap();
+            std::fs::write(directory.join("nav.kicad_pcb"), "(kicad_pcb)").unwrap();
+        }
+        let request = CrossProbeRequest {
+            project: IpcProjectIdentity {
+                name: "nav".to_string(),
+                path: temp.path().display().to_string(),
+            },
+            schematic_document_path: temp.path().join("nav.kicad_sch"),
+            pcb_document_path: temp.path().join("nav.kicad_pcb"),
+            schematic_sheet_instance_path: IpcSheetInstancePath {
+                kiids: vec!["root".to_string(), "child".to_string()],
+                human_readable: String::new(),
+            },
+            source_editor: IpcEditorKind::Pcb,
+            source_object_kiid: "fp".to_string(),
+        };
+        let client = konnect_ipc::KiCadIpcClient::new(spawn_manager_board_filename_mock(
+            temp.path().display().to_string(),
+            None,
+            false,
+            false,
+            0,
+        ));
+        let hierarchy = saved_manager_root_schematic_evidence(&client, &request).unwrap_err();
+        assert!(format!("{hierarchy:#}").contains("only the root"));
+
+        let mut root_request = request;
+        root_request.schematic_sheet_instance_path.kiids = vec!["root".to_string()];
+        let client = konnect_ipc::KiCadIpcClient::new(spawn_manager_board_filename_mock(
+            temp.path().display().to_string(),
+            Some(extra.path().display().to_string()),
+            false,
+            true,
+            2,
+        ));
+        let ambiguous = saved_manager_root_schematic_evidence(&client, &root_request).unwrap_err();
+        assert!(format!("{ambiguous:#}").contains("one manager basename observation"));
+
+        root_request.schematic_sheet_instance_path.kiids = vec!["stale-root".to_string()];
+        let client = konnect_ipc::KiCadIpcClient::new(spawn_manager_board_filename_mock(
+            temp.path().display().to_string(),
+            None,
+            true,
+            false,
+            2,
+        ));
+        let stale_root = saved_manager_root_schematic_evidence(&client, &root_request).unwrap_err();
+        assert!(format!("{stale_root:#}").contains("root sheet KIID does not match"));
+
+        root_request.schematic_sheet_instance_path.kiids = vec!["root".to_string()];
+        root_request.schematic_document_path = extra.path().join("nav.kicad_sch");
+        let client = konnect_ipc::KiCadIpcClient::new(spawn_manager_board_filename_mock(
+            temp.path().display().to_string(),
+            None,
+            true,
+            false,
+            0,
+        ));
+        let path_drift = saved_manager_root_schematic_evidence(&client, &root_request).unwrap_err();
+        assert!(format!("{path_drift:#}").contains("canonical same-stem project siblings"));
     }
 
     #[test]

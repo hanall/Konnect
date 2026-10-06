@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use konnect_sexp::writer::{
+    apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
+};
+use konnect_sexp::SexpEdit;
+
 #[derive(Debug, Clone)]
 struct LibraryFootprint {
     library_id: String,
@@ -27,10 +32,10 @@ struct LibraryFootprint {
 }
 
 #[derive(Debug)]
-struct ParsedLibraryProperties {
-    datasheet: Option<String>,
-    description: Option<String>,
-    custom: Vec<kiapi::board::types::Field>,
+pub(crate) struct ParsedLibraryProperties {
+    pub(crate) datasheet: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) custom: Vec<kiapi::board::types::Field>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -41,6 +46,7 @@ enum ChangedDomain {
     Attributes,
     Metadata,
     Models,
+    ObjectGraph,
 }
 
 #[derive(Debug)]
@@ -168,10 +174,10 @@ struct UpdatePlan {
 pub(crate) fn tool() -> ToolDef {
     tool!(
         "update_footprints_from_library",
-        "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
-         footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
-         exact plan revision. Preserves placed-instance state and pad nets while refreshing \
-         supported library-owned content.",
+        "Plan or atomically apply KiCad's Update Footprints from Library operation. The default \
+         uses typed IPC on the live board. An explicit closed-board opt-in can instead preserve \
+         the complete library S-expression object graph, including children KiCad 10 IPC cannot \
+         represent. Apply requires the exact dry-run revision.",
         json!({
             "type": "object",
             "properties": {
@@ -197,6 +203,11 @@ pub(crate) fn tool() -> ToolDef {
                 "expected_plan_revision": {
                     "type": "string",
                     "description": "Required for apply; exact revision returned by the reviewed dry run"
+                },
+                "allow_closed_board_file": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When no live KiCad holds this board, allow a guarded revision-bound atomic saved-file update that preserves the complete library object graph"
                 }
             },
             "required": ["board"],
@@ -204,7 +215,7 @@ pub(crate) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_update_footprints_from_library(args, ctx).await }
     )
-    .with_board_access(crate::tools::BoardAccess::LiveOnly)
+    .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback)
 }
 
 pub(crate) async fn handle_update_footprints_from_library(
@@ -215,6 +226,7 @@ pub(crate) async fn handle_update_footprints_from_library(
 
     let board_path = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let allow_closed_board_file = args["allow_closed_board_file"].as_bool().unwrap_or(false);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -248,6 +260,8 @@ pub(crate) async fn handle_update_footprints_from_library(
 
     let ipc_board_path = board_path.clone();
     let planning_board_path = board_path.clone();
+    let live_filters = filters.clone();
+    let live_expected_revision = expected_revision.clone();
     let operation = if dry_run {
         "footprint library update dry run"
     } else {
@@ -272,13 +286,13 @@ pub(crate) async fn handle_update_footprints_from_library(
                 &footprint_items,
                 &net_codes,
                 &routed_nets,
-                &filters,
+                &live_filters,
             );
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 return Ok(plan_response(&plan, false));
             }
-            if expected_revision.as_deref() != Some(plan.plan_revision.as_str()) {
+            if live_expected_revision.as_deref() != Some(plan.plan_revision.as_str()) {
                 plan.status = PlanStatus::Conflict;
                 plan.coverage.conflicts.planned += 1;
                 plan.diagnostics.push(UpdateDiagnostic {
@@ -296,9 +310,17 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
-            client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
-            })?;
+            let update_document = document.clone();
+            client.run_commit_recovering_in(
+                document,
+                "Update footprints from libraries",
+                |client| {
+                    client.update_items_in(
+                        update_document,
+                        std::mem::take(&mut plan.prepared_items),
+                    )
+                },
+            )?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -310,23 +332,38 @@ pub(crate) async fn handle_update_footprints_from_library(
 
     Ok(match result {
         BoardWrite::Ipc(response) => response,
+        BoardWrite::File(reason) if allow_closed_board_file => handle_closed_board_update(
+            &board_path,
+            &filters,
+            dry_run,
+            expected_revision.as_deref(),
+            reason.evidence(),
+        ),
         BoardWrite::File(reason) => preflight_conflict(format!(
-            "{} update_footprints_from_library is live-IPC-only and never edits the board \
-             file directly. Open the requested board in KiCad and retry.",
+            "{} The complete saved-file path was not enabled. Open the requested board in KiCad, \
+             or retry with allow_closed_board_file=true after confirming the saved file is authoritative.",
             reason.premise()
         )),
-        BoardWrite::Refused(result) => {
-            let message = result
-                .content
-                .into_iter()
-                .find_map(|content| match content {
-                    ToolContent::Text { text } => Some(text),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "KiCad refused the footprint library update".to_string());
-            preflight_conflict(message)
-        }
+        BoardWrite::Refused(result) => refused_live_update_result(result),
     })
+}
+
+fn refused_live_update_result(result: CallToolResult) -> CallToolResult {
+    if matches!(
+        crate::mcp::error::extract_error_kind(&result).as_deref(),
+        Some("ipc_outcome_unknown" | "ipc_batch_recovered")
+    ) {
+        return result;
+    }
+    let message = result
+        .content
+        .into_iter()
+        .find_map(|content| match content {
+            ToolContent::Text { text } => Some(text),
+            _ => None,
+        })
+        .unwrap_or_else(|| "KiCad refused the footprint library update".to_string());
+    preflight_conflict(message)
 }
 
 fn snapshot_routed_nets(
@@ -479,6 +516,1581 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
         references: parse(args, "references")?,
         library_ids: parse(args, "library_ids")?,
     })
+}
+
+#[derive(Debug, Clone)]
+struct RawChild {
+    tag: String,
+    block: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedPadInvariant {
+    number: String,
+    net: Option<String>,
+    uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedFootprintInvariant {
+    reference: String,
+    footprint_uuid: String,
+    placement: String,
+    layer: String,
+    protected_properties: BTreeMap<String, String>,
+    pads: Vec<ClosedPadInvariant>,
+    points: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ClosedPreparedUpdate {
+    replacement: String,
+    invariant: ClosedFootprintInvariant,
+}
+
+#[derive(Debug)]
+struct ClosedBoardPlan {
+    target_path: String,
+    status: PlanStatus,
+    plan_revision: String,
+    coverage: UpdateCoverage,
+    changes: Vec<PlannedUpdate>,
+    diagnostics: Vec<UpdateDiagnostic>,
+    original: String,
+    replacement: String,
+    invariants: Vec<ClosedFootprintInvariant>,
+}
+
+fn handle_closed_board_update(
+    board_path: &Path,
+    filters: &UpdateFilters,
+    dry_run: bool,
+    expected_revision: Option<&str>,
+    fallback_reason: serde_json::Value,
+) -> CallToolResult {
+    let mut plan = match plan_closed_board_updates(board_path, filters) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return closed_preflight_conflict(
+                format!("Closed-board footprint planning failed before mutation: {error:#}"),
+                board_path,
+                &fallback_reason,
+            )
+        }
+    };
+
+    if dry_run || plan.status == PlanStatus::Conflict {
+        return closed_plan_response(&plan, false, &fallback_reason, None);
+    }
+    if expected_revision != Some(plan.plan_revision.as_str()) {
+        plan.status = PlanStatus::Conflict;
+        plan.coverage.conflicts.planned += 1;
+        plan.changes.clear();
+        plan.diagnostics.push(UpdateDiagnostic {
+            code: "stale_plan_revision".to_string(),
+            message: "The saved board, selected libraries, or filters changed; rerun dry run and apply its new plan revision."
+                .to_string(),
+            reference: None,
+        });
+        return closed_plan_response(&plan, false, &fallback_reason, None);
+    }
+    if plan.status == PlanStatus::Noop {
+        return closed_plan_response(&plan, false, &fallback_reason, None);
+    }
+
+    match persist_closed_board_plan(board_path, &plan) {
+        Ok(()) => {
+            plan.coverage.selected.applied = plan.coverage.selected.planned;
+            plan.coverage.changed.applied = plan.coverage.changed.planned;
+            plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
+            plan.coverage.skipped_unlinked.applied = plan.coverage.skipped_unlinked.planned;
+            closed_plan_response(&plan, true, &fallback_reason, None)
+        }
+        Err(ClosedPersistFailure::BeforeMutation(reason)) => {
+            plan.status = PlanStatus::Conflict;
+            plan.coverage.conflicts.planned += 1;
+            plan.diagnostics.push(UpdateDiagnostic {
+                code: "closed_board_write_refused".to_string(),
+                message: reason,
+                reference: None,
+            });
+            closed_plan_response(&plan, false, &fallback_reason, Some("unchanged"))
+        }
+        Err(ClosedPersistFailure::RolledBack(reason)) => {
+            plan.status = PlanStatus::Conflict;
+            plan.coverage.conflicts.planned += 1;
+            plan.diagnostics.push(UpdateDiagnostic {
+                code: "closed_board_readback_rolled_back".to_string(),
+                message: reason,
+                reference: None,
+            });
+            closed_plan_response(&plan, false, &fallback_reason, Some("rolled_back"))
+        }
+        Err(ClosedPersistFailure::Uncertain(reason)) => {
+            plan.status = PlanStatus::Conflict;
+            plan.coverage.conflicts.planned += 1;
+            plan.diagnostics.push(UpdateDiagnostic {
+                code: "closed_board_persistence_uncertain".to_string(),
+                message: reason,
+                reference: None,
+            });
+            closed_plan_response(&plan, false, &fallback_reason, Some("uncertain"))
+        }
+    }
+}
+
+fn closed_preflight_conflict(
+    message: impl Into<String>,
+    board_path: &Path,
+    fallback_reason: &serde_json::Value,
+) -> CallToolResult {
+    CallToolResult::json(&json!({
+        "status": "conflict",
+        "coverage": {
+            "transport": "closed_board_file",
+            "atomicity": "compare_and_swap_atomic_replace_with_readback_and_rollback",
+            "selected": CountPair::default(),
+            "changed": CountPair::default(),
+            "unchanged": CountPair::default(),
+            "skipped_unlinked": CountPair::default(),
+            "conflicts": CountPair { planned: 1, applied: 0 }
+        },
+        "changes": [],
+        "target": { "board": board_path, "source": "saved_file" },
+        "diagnostics": [{
+            "code": "closed_board_preflight_conflict",
+            "message": message.into()
+        }],
+        "fallback_reason": fallback_reason,
+        "recovery": "unchanged",
+        "undo": null
+    }))
+}
+
+fn closed_plan_response(
+    plan: &ClosedBoardPlan,
+    applied: bool,
+    fallback_reason: &serde_json::Value,
+    recovery: Option<&str>,
+) -> CallToolResult {
+    CallToolResult::json(&json!({
+        "status": if applied {
+            "applied"
+        } else {
+            match plan.status {
+                PlanStatus::Ready => "ready",
+                PlanStatus::Noop => "noop",
+                PlanStatus::Conflict => "conflict",
+            }
+        },
+        "plan_revision": plan.plan_revision,
+        "coverage": {
+            "transport": "closed_board_file",
+            "atomicity": "compare_and_swap_atomic_replace_with_readback_and_rollback",
+            "selected": plan.coverage.selected,
+            "changed": plan.coverage.changed,
+            "unchanged": plan.coverage.unchanged,
+            "skipped_unlinked": plan.coverage.skipped_unlinked,
+            "conflicts": plan.coverage.conflicts
+        },
+        "changes": plan.changes,
+        "target": { "board": plan.target_path, "source": "saved_file" },
+        "diagnostics": plan.diagnostics,
+        "fallback_reason": fallback_reason,
+        "recovery": recovery,
+        "undo": null
+    }))
+}
+
+fn plan_closed_board_updates(
+    board_path: &Path,
+    filters: &UpdateFilters,
+) -> Result<ClosedBoardPlan> {
+    #[derive(Debug)]
+    struct Candidate {
+        reference: String,
+        library_id: String,
+        start: usize,
+        end: usize,
+        block: String,
+    }
+
+    if std::fs::symlink_metadata(board_path)
+        .context("failed to inspect the saved board path")?
+        .file_type()
+        .is_symlink()
+    {
+        bail!(
+            "saved board path '{}' is a symlink; closed-board refresh requires the canonical regular file path so planning and persistence cannot target different directory entries",
+            board_path.display()
+        );
+    }
+    let original = read_consistent(board_path).context("failed to read a stable saved board")?;
+    let target_path = board_path
+        .canonicalize()
+        .context("failed to establish the saved board identity")?;
+    let root =
+        konnect_sexp::parse_sexp(&original).context("saved board is not valid S-expression")?;
+    if root.head() != Some("kicad_pcb") {
+        bail!("saved document root is not kicad_pcb");
+    }
+
+    let mut candidates = Vec::new();
+    let mut reference_counts = BTreeMap::<String, usize>::new();
+    for (start, end) in find_direct_child_blocks(&original, "kicad_pcb") {
+        let block = &original[start..end];
+        let Ok(node) = konnect_sexp::parse_sexp(block) else {
+            continue;
+        };
+        if node.head() != Some("footprint") {
+            continue;
+        }
+        let reference = raw_footprint_reference(&node).unwrap_or_default();
+        *reference_counts.entry(reference.clone()).or_insert(0) += 1;
+        let library_id = node
+            .get(1)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .unwrap_or_default()
+            .to_string();
+        candidates.push(Candidate {
+            reference,
+            library_id,
+            start,
+            end,
+            block: block.to_string(),
+        });
+    }
+
+    let mut diagnostics = Vec::new();
+    if let Some(references) = filters.references.as_ref() {
+        for reference in references {
+            match reference_counts.get(reference).copied().unwrap_or(0) {
+                0 => diagnostics.push(UpdateDiagnostic {
+                    code: "reference_not_found".to_string(),
+                    message: format!("footprint reference '{reference}' was not found"),
+                    reference: Some(reference.clone()),
+                }),
+                count if count > 1 => diagnostics.push(UpdateDiagnostic {
+                    code: "duplicate_reference".to_string(),
+                    message: format!("footprint reference '{reference}' appears {count} times"),
+                    reference: Some(reference.clone()),
+                }),
+                _ => {}
+            }
+        }
+    } else {
+        for (reference, count) in &reference_counts {
+            if *count > 1 {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "duplicate_reference".to_string(),
+                    message: format!("footprint reference '{reference}' appears {count} times"),
+                    reference: Some(reference.clone()),
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        left.reference
+            .cmp(&right.reference)
+            .then_with(|| left.library_id.cmp(&right.library_id))
+    });
+    let selected = candidates
+        .into_iter()
+        .filter(|candidate| {
+            filters
+                .references
+                .as_ref()
+                .is_none_or(|references| references.contains(&candidate.reference))
+        })
+        .filter(|candidate| {
+            filters
+                .library_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&candidate.library_id))
+        })
+        .collect::<Vec<_>>();
+
+    let mut coverage = UpdateCoverage::default();
+    coverage.skipped_unlinked.planned = selected
+        .iter()
+        .filter(|candidate| candidate.library_id.is_empty())
+        .count();
+    coverage.selected.planned = selected
+        .iter()
+        .filter(|candidate| !candidate.library_id.is_empty())
+        .count();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"closed_board_lossless_v1\0");
+    let target_bytes = target_path.as_os_str().as_encoded_bytes();
+    hasher.update((target_bytes.len() as u64).to_le_bytes());
+    hasher.update(target_bytes);
+    hasher.update(original.as_bytes());
+    hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
+    let mut changes = Vec::new();
+    let mut edits = Vec::new();
+    let mut invariants = Vec::new();
+
+    for candidate in selected {
+        if candidate.library_id.is_empty() {
+            continue;
+        }
+        let library_path = match super::library::resolve_footprint_path(
+            &candidate.library_id,
+            board_path.parent(),
+        ) {
+            Ok(path) => path,
+            Err(message) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_library_resolution_failed".to_string(),
+                    message,
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+        let source = match std::fs::read_to_string(&library_path) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_library_read_failed".to_string(),
+                    message: format!("failed to read {}: {error}", library_path.display()),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+        hasher.update(candidate.library_id.as_bytes());
+        hasher.update(library_path.as_os_str().as_encoded_bytes());
+        hasher.update(source.as_bytes());
+
+        let prepared = match prepare_closed_board_footprint(
+            &candidate.block,
+            &candidate.library_id,
+            &source,
+            &library_path,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "closed_board_footprint_conflict".to_string(),
+                    message: format!("{error:#}"),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+
+        if prepared.replacement == candidate.block {
+            coverage.unchanged.planned += 1;
+        } else {
+            coverage.changed.planned += 1;
+            changes.push(PlannedUpdate {
+                reference: candidate.reference,
+                library_id: candidate.library_id,
+                changed_domains: BTreeSet::from([ChangedDomain::ObjectGraph]),
+                preserved: PreservedState {
+                    position: true,
+                    rotation: true,
+                    layer: true,
+                    locked: true,
+                    kiid: true,
+                    symbol_path: true,
+                    pad_nets: true,
+                    instance_overrides: true,
+                },
+            });
+            edits.push(SexpEdit::replace(
+                candidate.start,
+                candidate.end,
+                prepared.replacement,
+            ));
+            invariants.push(prepared.invariant);
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        coverage.conflicts.planned = diagnostics.len();
+        coverage.changed.planned = 0;
+        changes.clear();
+        invariants.clear();
+        return Ok(ClosedBoardPlan {
+            target_path: target_path.display().to_string(),
+            status: PlanStatus::Conflict,
+            plan_revision: format!("{:x}", hasher.finalize()),
+            coverage,
+            changes,
+            diagnostics,
+            original: original.clone(),
+            replacement: original,
+            invariants,
+        });
+    }
+
+    let replacement = apply_edits(original.clone(), edits);
+    let replacement_root = konnect_sexp::parse_sexp(&replacement)
+        .context("closed-board update would produce invalid S-expression")?;
+    if replacement_root.head() != Some("kicad_pcb") {
+        bail!("closed-board update would replace the board root");
+    }
+    validate_unique_document_uuids(&replacement_root)?;
+    verify_closed_board_invariants(&replacement, &invariants)?;
+    let status = if changes.is_empty() {
+        PlanStatus::Noop
+    } else {
+        PlanStatus::Ready
+    };
+    Ok(ClosedBoardPlan {
+        target_path: target_path.display().to_string(),
+        status,
+        plan_revision: format!("{:x}", hasher.finalize()),
+        coverage,
+        changes,
+        diagnostics,
+        original,
+        replacement,
+        invariants,
+    })
+}
+
+fn validate_unique_document_uuids(root: &konnect_sexp::SexpNode) -> Result<()> {
+    fn visit(node: &konnect_sexp::SexpNode, seen: &mut BTreeSet<String>) -> Result<()> {
+        if matches!(node.head(), Some("uuid" | "tstamp")) {
+            if let Some(value) = node.get(1).and_then(konnect_sexp::SexpNode::as_str) {
+                if !seen.insert(value.to_string()) {
+                    bail!("written board would contain duplicate UUID/tstamp '{value}'");
+                }
+            }
+        }
+        for child in node.children().unwrap_or_default() {
+            visit(child, seen)?;
+        }
+        Ok(())
+    }
+
+    visit(root, &mut BTreeSet::new())
+}
+
+fn raw_direct_children(source: &str, root_tag: &str) -> Result<Vec<RawChild>> {
+    let root = konnect_sexp::parse_sexp(source)
+        .with_context(|| format!("invalid {root_tag} S-expression"))?;
+    if root.head() != Some(root_tag) {
+        bail!("expected {root_tag} root");
+    }
+    find_direct_child_blocks(source, root_tag)
+        .into_iter()
+        .map(|(start, end)| {
+            let block = source[start..end].to_string();
+            let child = konnect_sexp::parse_sexp(&block).context("invalid direct child")?;
+            let tag = child.head().context("direct child has no tag")?.to_string();
+            Ok(RawChild { tag, block })
+        })
+        .collect()
+}
+
+fn children_named(children: &[RawChild], tag: &str) -> Vec<String> {
+    children
+        .iter()
+        .filter(|child| child.tag == tag)
+        .map(|child| child.block.clone())
+        .collect()
+}
+
+fn exactly_one_child(children: &[RawChild], tag: &str, subject: &str) -> Result<String> {
+    let matches = children_named(children, tag);
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => bail!("{subject} is missing its '{tag}' child"),
+        _ => bail!("{subject} contains more than one '{tag}' child"),
+    }
+}
+
+fn raw_footprint_reference(root: &konnect_sexp::SexpNode) -> Option<String> {
+    root.find_all("property")
+        .into_iter()
+        .find(|property| {
+            property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference")
+        })
+        .and_then(|property| property.get(2))
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .or_else(|| {
+            root.find_all("fp_text")
+                .into_iter()
+                .find(|text| {
+                    text.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("reference")
+                })
+                .and_then(|text| text.get(2))
+                .and_then(konnect_sexp::SexpNode::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn property_name(block: &str) -> Result<String> {
+    let node = konnect_sexp::parse_sexp(block).context("invalid property")?;
+    node.get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .map(str::to_string)
+        .context("property is missing its name")
+}
+
+fn pad_number(block: &str) -> Result<String> {
+    let node = konnect_sexp::parse_sexp(block).context("invalid pad")?;
+    node.get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .map(str::to_string)
+        .context("pad is missing its number")
+}
+
+fn replace_direct_occurrence(
+    source: &str,
+    root_tag: &str,
+    child_tag: &str,
+    occurrence: usize,
+    replacement: &str,
+) -> Result<String> {
+    let mut found = 0usize;
+    for (start, end) in find_direct_child_blocks(source, root_tag) {
+        let node = konnect_sexp::parse_sexp(&source[start..end])?;
+        if node.head() != Some(child_tag) {
+            continue;
+        }
+        if found == occurrence {
+            return Ok(apply_edits(
+                source.to_string(),
+                vec![SexpEdit::replace(start, end, replacement)],
+            ));
+        }
+        found += 1;
+    }
+    bail!("{root_tag} has no {child_tag} occurrence {occurrence}")
+}
+
+fn append_direct_child(source: &str, block: &str) -> Result<String> {
+    let trimmed_end = source.trim_end().len();
+    let close = source[..trimmed_end]
+        .rfind(')')
+        .context("root expression has no closing paren")?;
+    Ok(apply_edits(
+        source.to_string(),
+        vec![SexpEdit::insert(close, format!("\n\t{block}"))],
+    ))
+}
+
+fn replace_or_append_single_child(
+    source: &str,
+    root_tag: &str,
+    child_tag: &str,
+    replacement: &str,
+) -> Result<String> {
+    let count = raw_direct_children(source, root_tag)?
+        .iter()
+        .filter(|child| child.tag == child_tag)
+        .count();
+    match count {
+        0 => append_direct_child(source, replacement),
+        1 => replace_direct_occurrence(source, root_tag, child_tag, 0, replacement),
+        _ => bail!("{root_tag} contains more than one '{child_tag}' child"),
+    }
+}
+
+fn direct_child_block(source: &str, root_tag: &str, tag: &str) -> Result<Option<String>> {
+    let matches = children_named(&raw_direct_children(source, root_tag)?, tag);
+    match matches.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        _ => bail!("{root_tag} contains more than one '{tag}' child"),
+    }
+}
+
+fn transplant_item_identity(mut replacement: String, current: &str) -> Result<String> {
+    let current_tag = konnect_sexp::parse_sexp(current)?
+        .head()
+        .context("current item has no tag")?
+        .to_string();
+    let replacement_tag = konnect_sexp::parse_sexp(&replacement)?
+        .head()
+        .context("replacement item has no tag")?
+        .to_string();
+    if current_tag != replacement_tag {
+        bail!("cannot transplant identity from '{current_tag}' to '{replacement_tag}'");
+    }
+    for tag in ["uuid", "tstamp"] {
+        if let Some(block) = direct_child_block(current, &current_tag, tag)? {
+            replacement =
+                replace_or_append_single_child(&replacement, &replacement_tag, tag, &block)?;
+        }
+    }
+    Ok(replacement)
+}
+
+fn one_graphic(block: &str) -> Result<konnect_ipc::IpcGraphicDefinition> {
+    let source = format!("(footprint \"Guard\" (layer \"F.Cu\") {block})");
+    let graphics = super::pcb_components::extract_graphic_definitions_without_properties(&source)?;
+    match graphics.as_slice() {
+        [graphic] => Ok(graphic.clone()),
+        [] => bail!("graphic is hidden or has no typed semantic representation"),
+        _ => bail!("one graphic block produced more than one semantic graphic"),
+    }
+}
+
+fn graphic_semantically_equal(
+    left: &konnect_ipc::IpcGraphicDefinition,
+    right: &konnect_ipc::IpcGraphicDefinition,
+) -> bool {
+    use konnect_ipc::IpcGraphicDefinition as Graphic;
+    let number = |a: f64, b: f64| (a - b).abs() <= 0.000_002;
+    let point = |a: &(f64, f64), b: &(f64, f64)| number(a.0, b.0) && number(a.1, b.1);
+    match (left, right) {
+        (
+            Graphic::Line {
+                start: a_start,
+                end: a_end,
+                layer: a_layer,
+                width: a_width,
+            },
+            Graphic::Line {
+                start: b_start,
+                end: b_end,
+                layer: b_layer,
+                width: b_width,
+            },
+        ) => {
+            point(a_start, b_start)
+                && point(a_end, b_end)
+                && a_layer == b_layer
+                && number(*a_width, *b_width)
+        }
+        (
+            Graphic::Rect {
+                start: a_start,
+                end: a_end,
+                layer: a_layer,
+                width: a_width,
+                filled: a_filled,
+            },
+            Graphic::Rect {
+                start: b_start,
+                end: b_end,
+                layer: b_layer,
+                width: b_width,
+                filled: b_filled,
+            },
+        ) => {
+            point(a_start, b_start)
+                && point(a_end, b_end)
+                && a_layer == b_layer
+                && number(*a_width, *b_width)
+                && a_filled == b_filled
+        }
+        (
+            Graphic::Circle {
+                center: a_center,
+                end: a_end,
+                layer: a_layer,
+                width: a_width,
+                filled: a_filled,
+            },
+            Graphic::Circle {
+                center: b_center,
+                end: b_end,
+                layer: b_layer,
+                width: b_width,
+                filled: b_filled,
+            },
+        ) => {
+            point(a_center, b_center)
+                && point(a_end, b_end)
+                && a_layer == b_layer
+                && number(*a_width, *b_width)
+                && a_filled == b_filled
+        }
+        (
+            Graphic::Arc {
+                start: a_start,
+                mid: a_mid,
+                end: a_end,
+                layer: a_layer,
+                width: a_width,
+            },
+            Graphic::Arc {
+                start: b_start,
+                mid: b_mid,
+                end: b_end,
+                layer: b_layer,
+                width: b_width,
+            },
+        ) => {
+            point(a_start, b_start)
+                && point(a_mid, b_mid)
+                && point(a_end, b_end)
+                && a_layer == b_layer
+                && number(*a_width, *b_width)
+        }
+        (
+            Graphic::Poly {
+                points: a_points,
+                layer: a_layer,
+                width: a_width,
+                filled: a_filled,
+            },
+            Graphic::Poly {
+                points: b_points,
+                layer: b_layer,
+                width: b_width,
+                filled: b_filled,
+            },
+        ) => {
+            a_points.len() == b_points.len()
+                && a_points
+                    .iter()
+                    .zip(b_points)
+                    .all(|(left, right)| point(left, right))
+                && a_layer == b_layer
+                && number(*a_width, *b_width)
+                && a_filled == b_filled
+        }
+        (
+            Graphic::Text {
+                text: a_text,
+                position: a_position,
+                rotation: a_rotation,
+                layer: a_layer,
+                size: a_size,
+                stroke_width_mm: a_stroke,
+            },
+            Graphic::Text {
+                text: b_text,
+                position: b_position,
+                rotation: b_rotation,
+                layer: b_layer,
+                size: b_size,
+                stroke_width_mm: b_stroke,
+            },
+        ) => {
+            a_text == b_text
+                && point(a_position, b_position)
+                && number(*a_rotation, *b_rotation)
+                && a_layer == b_layer
+                && number(*a_size, *b_size)
+                && number(*a_stroke, *b_stroke)
+        }
+        _ => false,
+    }
+}
+
+fn match_existing_graphics(
+    reference: &str,
+    tag: &str,
+    current: &[String],
+    library: &[String],
+) -> Result<Vec<(usize, usize)>> {
+    let current = current
+        .iter()
+        .map(|block| one_graphic(block))
+        .collect::<Result<Vec<_>>>()?;
+    let library = library
+        .iter()
+        .map(|block| one_graphic(block))
+        .collect::<Result<Vec<_>>>()?;
+    let mut used = vec![false; library.len()];
+    let mut matches = Vec::with_capacity(current.len());
+    for (current_index, current_graphic) in current.iter().enumerate() {
+        let Some(library_index) = library.iter().enumerate().find_map(|(index, candidate)| {
+            (!used[index] && graphic_semantically_equal(current_graphic, candidate))
+                .then_some(index)
+        }) else {
+            bail!(
+                "footprint '{reference}' has a '{tag}' graphic that does not match the current library within 2 nm; its board-user versus stale-library ownership is ambiguous, so it was not replaced"
+            );
+        };
+        used[library_index] = true;
+        matches.push((current_index, library_index));
+    }
+    Ok(matches)
+}
+
+fn user_fp_text_identity(block: &str) -> Result<String> {
+    let node = konnect_sexp::parse_sexp(block).context("invalid fp_text")?;
+    if node.head() != Some("fp_text") {
+        bail!("expected fp_text root");
+    }
+    let kind = node
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("fp_text is missing its kind")?;
+    if kind != "user" {
+        bail!(
+            "closed-board refresh only preserves existing fp_text user annotations; found '{kind}'"
+        );
+    }
+    node.get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .context("fp_text user has no non-empty text identity")
+}
+
+fn match_preserved_user_texts(
+    reference: &str,
+    current: &[String],
+    library: &[String],
+) -> Result<Vec<(usize, usize)>> {
+    let mut current_by_text = BTreeMap::new();
+    for (index, block) in current.iter().enumerate() {
+        let text = user_fp_text_identity(block)?;
+        if current_by_text.insert(text.clone(), index).is_some() {
+            bail!(
+                "footprint '{reference}' contains duplicate fp_text user identity '{text}'; ownership is ambiguous"
+            );
+        }
+    }
+    let mut library_by_text = BTreeMap::new();
+    for (index, block) in library.iter().enumerate() {
+        let text = user_fp_text_identity(block)?;
+        if library_by_text.insert(text.clone(), index).is_some() {
+            bail!(
+                "library for footprint '{reference}' contains duplicate fp_text user identity '{text}'; ownership is ambiguous"
+            );
+        }
+    }
+    if current_by_text.keys().ne(library_by_text.keys()) {
+        bail!(
+            "footprint '{reference}' and its library have different fp_text user identities; addition, deletion, or content change is ambiguous"
+        );
+    }
+    Ok(current_by_text
+        .into_iter()
+        .map(|(text, current_index)| (current_index, library_by_text[&text]))
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+struct SemanticPoint {
+    x: f64,
+    y: f64,
+    size: f64,
+    layer: String,
+}
+
+fn one_point(block: &str) -> Result<SemanticPoint> {
+    let node = konnect_sexp::parse_sexp(block).context("invalid point")?;
+    if node.head() != Some("point") {
+        bail!("expected point root");
+    }
+    for child in node.children().unwrap_or_default().iter().skip(1) {
+        let tag = child.head().context("point contains a direct atom")?;
+        if !matches!(tag, "at" | "size" | "layer" | "uuid" | "tstamp") {
+            bail!("point contains unsupported clause '{tag}'");
+        }
+    }
+    let at = node.find("at").context("point is missing at")?;
+    let size = node.find("size").context("point is missing size")?;
+    Ok(SemanticPoint {
+        x: at.get_f64(1).context("point X is invalid")?,
+        y: at.get_f64(2).context("point Y is invalid")?,
+        size: size.get_f64(1).context("point size is invalid")?,
+        layer: node
+            .find_str("layer")
+            .context("point layer is missing")?
+            .to_string(),
+    })
+}
+
+fn point_semantically_equal(left: &SemanticPoint, right: &SemanticPoint) -> bool {
+    let number = |a: f64, b: f64| (a - b).abs() <= 0.000_002;
+    number(left.x, right.x)
+        && number(left.y, right.y)
+        && number(left.size, right.size)
+        && left.layer == right.layer
+}
+
+fn match_existing_points(
+    reference: &str,
+    current: &[String],
+    library: &[String],
+) -> Result<Vec<(usize, usize)>> {
+    let current = current
+        .iter()
+        .map(|block| one_point(block))
+        .collect::<Result<Vec<_>>>()?;
+    let library = library
+        .iter()
+        .map(|block| one_point(block))
+        .collect::<Result<Vec<_>>>()?;
+    let mut used = vec![false; library.len()];
+    let mut matches = Vec::with_capacity(current.len());
+    for (current_index, current_point) in current.iter().enumerate() {
+        let Some(library_index) = library.iter().enumerate().find_map(|(index, candidate)| {
+            (!used[index] && point_semantically_equal(current_point, candidate)).then_some(index)
+        }) else {
+            bail!(
+                "footprint '{reference}' contains a board point without a distinct semantic library match; point ownership is ambiguous"
+            );
+        };
+        used[library_index] = true;
+        matches.push((current_index, library_index));
+    }
+    Ok(matches)
+}
+
+fn one_pad(block: &str) -> Result<konnect_ipc::IpcPadDefinition> {
+    let source = format!("(footprint \"Guard\" (layer \"F.Cu\") {block})");
+    let pads = super::pcb_components::extract_pad_definitions(&source)?;
+    match pads.as_slice() {
+        [pad] => Ok(pad.clone()),
+        _ => bail!("one pad block did not produce exactly one semantic pad"),
+    }
+}
+
+fn pad_semantically_equal(
+    left: &konnect_ipc::IpcPadDefinition,
+    right: &konnect_ipc::IpcPadDefinition,
+) -> bool {
+    let number = |a: f64, b: f64| (a - b).abs() <= 0.000_002;
+    let optional = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => number(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    left.number == right.number
+        && left.pad_type == right.pad_type
+        && left.shape == right.shape
+        && number(left.x, right.x)
+        && number(left.y, right.y)
+        && number(left.rotation, right.rotation)
+        && number(left.size_x, right.size_x)
+        && number(left.size_y, right.size_y)
+        && optional(left.drill_x, right.drill_x)
+        && optional(left.drill_y, right.drill_y)
+        && left.drill_oval == right.drill_oval
+        && left.layers == right.layers
+        && number(left.roundrect_ratio, right.roundrect_ratio)
+}
+
+fn item_identity(block: &str) -> Result<Option<String>> {
+    let tag = konnect_sexp::parse_sexp(block)?
+        .head()
+        .context("item has no tag")?
+        .to_string();
+    Ok(direct_child_block(block, &tag, "uuid")?.or(direct_child_block(block, &tag, "tstamp")?))
+}
+
+fn deterministic_child_uuid(seed: &str, tag: &str, occurrence: usize) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"konnect-closed-footprint-child-v1\0");
+    hash.update(seed.as_bytes());
+    hash.update([0]);
+    hash.update(tag.as_bytes());
+    hash.update([0]);
+    hash.update(occurrence.to_le_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn set_item_uuid(block: &str, uuid: &str) -> Result<String> {
+    let tag = konnect_sexp::parse_sexp(block)?
+        .head()
+        .context("item has no tag")?
+        .to_string();
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(block, &tag) {
+        let child = konnect_sexp::parse_sexp(&block[start..end])?;
+        if matches!(child.head(), Some("uuid" | "tstamp")) {
+            edits.push(SexpEdit::delete(start, end));
+        }
+    }
+    append_direct_child(
+        &apply_edits(block.to_string(), edits),
+        &format!("(uuid \"{uuid}\")"),
+    )
+}
+
+fn assign_fresh_new_child_uuids(
+    replacement: &str,
+    current_children: &[RawChild],
+    root_uuid: &str,
+) -> Result<String> {
+    let current_identities = current_children
+        .iter()
+        .filter_map(|child| item_identity(&child.block).ok().flatten())
+        .collect::<BTreeSet<_>>();
+    let mut result = replacement.to_string();
+    for tag in [
+        "property",
+        "fp_text",
+        "fp_line",
+        "fp_rect",
+        "fp_circle",
+        "fp_arc",
+        "fp_poly",
+        "pad",
+    ] {
+        let count = raw_direct_children(&result, "footprint")?
+            .iter()
+            .filter(|child| child.tag == tag)
+            .count();
+        for occurrence in 0..count {
+            let items = children_named(&raw_direct_children(&result, "footprint")?, tag);
+            let item = &items[occurrence];
+            if item_identity(item)?
+                .as_ref()
+                .is_some_and(|identity| current_identities.contains(identity))
+            {
+                continue;
+            }
+            let uuid = deterministic_child_uuid(root_uuid, tag, occurrence);
+            let item = set_item_uuid(item, &uuid)?;
+            result = replace_direct_occurrence(&result, "footprint", tag, occurrence, &item)?;
+        }
+    }
+    Ok(result)
+}
+
+fn prepare_closed_board_footprint(
+    current: &str,
+    library_id: &str,
+    library_source: &str,
+    library_path: &Path,
+) -> Result<ClosedPreparedUpdate> {
+    let current_root = konnect_sexp::parse_sexp(current).context("invalid board footprint")?;
+    if current_root.head() != Some("footprint") {
+        bail!("board item is not a footprint");
+    }
+    let current_id = current_root
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("board footprint has no library id")?;
+    if current_id != library_id {
+        bail!("board footprint library id '{current_id}' does not match '{library_id}'");
+    }
+    let reference = raw_footprint_reference(&current_root)
+        .context("board footprint has no Reference property")?;
+    let current_children = raw_direct_children(current, "footprint")?;
+    let layer_block = exactly_one_child(&current_children, "layer", "board footprint")?;
+    let layer_node = konnect_sexp::parse_sexp(&layer_block)?;
+    let layer = layer_node
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("board footprint layer is invalid")?;
+    if layer != "F.Cu" {
+        bail!(
+            "closed-board lossless refresh currently supports F.Cu only; footprint '{reference}' is on '{layer}'"
+        );
+    }
+    let at_block = exactly_one_child(&current_children, "at", "board footprint")?;
+    let at = konnect_sexp::parse_sexp(&at_block)?;
+    let x = at.get_f64(1).context("footprint placement X is invalid")?;
+    let y = at.get_f64(2).context("footprint placement Y is invalid")?;
+    let rotation = at.get_f64(3).unwrap_or(0.0);
+    let uuid_block = exactly_one_child(&current_children, "uuid", "board footprint")?;
+
+    let library_root = konnect_sexp::parse_sexp(library_source)
+        .context("invalid library footprint S-expression")?;
+    if library_root.head() != Some("footprint") {
+        bail!("library source root is not a footprint");
+    }
+    let library_children = raw_direct_children(library_source, "footprint")?;
+    if current_children
+        .iter()
+        .chain(library_children.iter())
+        .any(|child| child.tag == "group")
+    {
+        bail!(
+            "footprint '{reference}' or library '{library_id}' contains a group; closed-board refresh cannot yet remap group member UUIDs losslessly"
+        );
+    }
+
+    let graphic_tags = [
+        "fp_text",
+        "fp_line",
+        "fp_rect",
+        "fp_circle",
+        "fp_arc",
+        "fp_poly",
+    ];
+    for unsupported in [
+        "fp_text_box",
+        "fp_curve",
+        "table",
+        "image",
+        "barcode",
+        "dimension",
+        "zone",
+    ] {
+        if current_children
+            .iter()
+            .chain(library_children.iter())
+            .any(|child| child.tag == unsupported)
+        {
+            bail!(
+                "footprint '{reference}' contains '{unsupported}', which closed-board refresh does not yet preserve losslessly"
+            );
+        }
+    }
+    let current_points = children_named(&current_children, "point");
+    let library_points = children_named(&library_children, "point");
+    let point_matches = match_existing_points(&reference, &current_points, &library_points)?;
+
+    let current_pad_blocks = children_named(&current_children, "pad");
+    let library_pad_blocks = children_named(&library_children, "pad");
+    let current_pads = unique_pads(&current_pad_blocks, "board footprint")?;
+    let library_pads = unique_pads(&library_pad_blocks, "library footprint")?;
+    for (number, block) in &current_pads {
+        if library_pads.contains_key(number) {
+            continue;
+        }
+        if direct_child_block(block, "pad", "net")?.is_some() {
+            bail!(
+                "library update removes connected pad {number} from footprint '{reference}'; routed or connected copper would lose its anchor"
+            );
+        }
+        bail!(
+            "library update removes unconnected pad {number} from footprint '{reference}'; board-user versus stale-library pad ownership is ambiguous"
+        );
+    }
+
+    let mut replacement = super::pcb_components::board_footprint_sexp_from_source(
+        library_source,
+        library_id,
+        library_path,
+        x,
+        y,
+        rotation,
+        layer,
+        Some(&reference),
+    )
+    .map_err(anyhow::Error::msg)?;
+    for (tag, block) in [
+        ("layer", layer_block.as_str()),
+        ("at", at_block.as_str()),
+        ("uuid", uuid_block.as_str()),
+    ] {
+        replacement = replace_or_append_single_child(&replacement, "footprint", tag, block)?;
+    }
+
+    let instance_tags = [
+        "locked",
+        "placed",
+        "path",
+        "sheetname",
+        "sheetfile",
+        "units",
+        "component_classes",
+        "variant",
+        "solder_mask_margin",
+        "solder_paste_margin",
+        "solder_paste_ratio",
+        "solder_paste_margin_ratio",
+        "clearance",
+        "zone_connect",
+        "thermal_width",
+        "thermal_gap",
+    ];
+    for tag in instance_tags {
+        let blocks = children_named(&current_children, tag);
+        if blocks.len() > 1 {
+            bail!("board footprint contains more than one '{tag}' child");
+        }
+        if let Some(block) = blocks.first() {
+            replacement = replace_or_append_single_child(&replacement, "footprint", tag, block)?;
+        }
+    }
+
+    replacement = merge_root_properties(&replacement, &current_children, &library_children)?;
+    replacement = merge_root_attributes(&replacement, &current_children)?;
+
+    for tag in graphic_tags {
+        let current_items = children_named(&current_children, tag);
+        let replacement_children = raw_direct_children(&replacement, "footprint")?;
+        let replacement_items = children_named(&replacement_children, tag);
+        if tag == "fp_text" {
+            for (current_index, replacement_index) in
+                match_preserved_user_texts(&reference, &current_items, &replacement_items)?
+            {
+                replacement = replace_direct_occurrence(
+                    &replacement,
+                    "footprint",
+                    tag,
+                    replacement_index,
+                    &current_items[current_index],
+                )?;
+            }
+            continue;
+        }
+        let matches = match_existing_graphics(&reference, tag, &current_items, &replacement_items)?;
+        for (current_index, replacement_index) in matches {
+            let current_item = &current_items[current_index];
+            let replacement_item = &replacement_items[replacement_index];
+            let item = transplant_item_identity(replacement_item.clone(), current_item)?;
+            replacement = replace_direct_occurrence(
+                &replacement,
+                "footprint",
+                tag,
+                replacement_index,
+                &item,
+            )?;
+        }
+    }
+    for (current_index, replacement_index) in point_matches {
+        let replacement_points =
+            children_named(&raw_direct_children(&replacement, "footprint")?, "point");
+        let point = transplant_item_identity(
+            replacement_points[replacement_index].clone(),
+            &current_points[current_index],
+        )?;
+        replacement = replace_direct_occurrence(
+            &replacement,
+            "footprint",
+            "point",
+            replacement_index,
+            &point,
+        )?;
+    }
+
+    let replacement_children = raw_direct_children(&replacement, "footprint")?;
+    let replacement_pad_blocks = children_named(&replacement_children, "pad");
+    let replacement_pads = unique_pads(&replacement_pad_blocks, "prepared footprint")?;
+    for (number, current_pad) in &current_pads {
+        let Some(replacement_pad) = replacement_pads.get(number) else {
+            continue;
+        };
+        if !pad_semantically_equal(&one_pad(current_pad)?, &one_pad(replacement_pad)?) {
+            bail!(
+                "footprint '{reference}' pad {number} geometry does not match the current library within 2 nm; board-user versus stale-library pad ownership is ambiguous, so it was not replaced"
+            );
+        }
+        let mut pad = transplant_item_identity(replacement_pad.clone(), current_pad)?;
+        for tag in [
+            "net",
+            "locked",
+            "pinfunction",
+            "pintype",
+            "zone_layer_connections",
+        ] {
+            if let Some(block) = direct_child_block(current_pad, "pad", tag)? {
+                pad = replace_or_append_single_child(&pad, "pad", tag, &block)?;
+            }
+        }
+        let current_replacement_children = raw_direct_children(&replacement, "footprint")?;
+        let occurrence = children_named(&current_replacement_children, "pad")
+            .iter()
+            .position(|block| pad_number(block).ok().as_deref() == Some(number.as_str()))
+            .context("prepared pad disappeared")?;
+        replacement =
+            replace_direct_occurrence(&replacement, "footprint", "pad", occurrence, &pad)?;
+    }
+    replacement = assign_fresh_new_child_uuids(&replacement, &current_children, &uuid_block)?;
+
+    let replacement_root = konnect_sexp::parse_sexp(&replacement)
+        .context("prepared footprint is invalid S-expression")?;
+    if raw_footprint_reference(&replacement_root).as_deref() != Some(reference.as_str()) {
+        bail!("prepared footprint did not preserve reference '{reference}'");
+    }
+    let invariant = closed_footprint_invariant(&replacement, &library_children)?;
+    let current_invariant = closed_footprint_invariant(current, &[])?;
+    if invariant.footprint_uuid != current_invariant.footprint_uuid
+        || invariant.placement != current_invariant.placement
+        || invariant.layer != current_invariant.layer
+    {
+        bail!("prepared footprint did not preserve root identity and placement");
+    }
+    Ok(ClosedPreparedUpdate {
+        replacement,
+        invariant,
+    })
+}
+
+fn unique_pads(blocks: &[String], subject: &str) -> Result<BTreeMap<String, String>> {
+    let mut pads = BTreeMap::new();
+    for block in blocks {
+        let number = pad_number(block)?;
+        if pads.insert(number.clone(), block.clone()).is_some() {
+            bail!("{subject} contains duplicate pad number '{number}'");
+        }
+    }
+    Ok(pads)
+}
+
+fn merge_root_properties(
+    replacement: &str,
+    current_children: &[RawChild],
+    library_children: &[RawChild],
+) -> Result<String> {
+    let current_properties = children_named(current_children, "property");
+    let library_properties = children_named(library_children, "property");
+    let mut library_names = BTreeSet::new();
+    for property in &library_properties {
+        let name = property_name(property)?;
+        if !library_names.insert(name.clone()) {
+            bail!("library footprint contains duplicate property '{name}'");
+        }
+    }
+
+    let mut result = replacement.to_string();
+    let mut current_names = BTreeSet::new();
+    for property in current_properties {
+        let name = property_name(&property)?;
+        if !current_names.insert(name.clone()) {
+            bail!("board footprint contains duplicate property '{name}'");
+        }
+        let replacement_children = raw_direct_children(&result, "footprint")?;
+        let replacement_properties = children_named(&replacement_children, "property");
+        let matching = replacement_properties
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                (property_name(block).ok().as_deref() == Some(name.as_str())).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            bail!("prepared footprint contains duplicate property '{name}'");
+        }
+        if matches!(name.as_str(), "Reference" | "Value") {
+            let index = matching
+                .first()
+                .copied()
+                .with_context(|| format!("library footprint is missing property '{name}'"))?;
+            result = replace_direct_occurrence(&result, "footprint", "property", index, &property)?;
+        } else if !library_names.contains(&name) {
+            result = append_direct_child(&result, &property)?;
+        } else if let Some(index) = matching.first().copied() {
+            let replacement_children = raw_direct_children(&result, "footprint")?;
+            let replacement_properties = children_named(&replacement_children, "property");
+            let with_identity =
+                transplant_item_identity(replacement_properties[index].clone(), &property)?;
+            result =
+                replace_direct_occurrence(&result, "footprint", "property", index, &with_identity)?;
+        }
+    }
+    Ok(result)
+}
+
+fn merge_root_attributes(replacement: &str, current_children: &[RawChild]) -> Result<String> {
+    let mut instance_tokens = BTreeSet::new();
+    if let Some(current) = children_named(current_children, "attr").first() {
+        let node = konnect_sexp::parse_sexp(current)?;
+        for child in node.children().unwrap_or_default().iter().skip(1) {
+            if let Some(token) = child.as_str() {
+                if matches!(
+                    token,
+                    "board_only" | "exclude_from_pos_files" | "exclude_from_bom" | "dnp"
+                ) {
+                    instance_tokens.insert(token.to_string());
+                }
+            }
+        }
+    }
+    let replacement_children = raw_direct_children(replacement, "footprint")?;
+    let attr = children_named(&replacement_children, "attr");
+    if attr.len() > 1 {
+        bail!("library footprint contains more than one attr child");
+    }
+    let mut tokens = Vec::new();
+    if let Some(attr) = attr.first() {
+        let node = konnect_sexp::parse_sexp(attr)?;
+        for child in node.children().unwrap_or_default().iter().skip(1) {
+            let token = child
+                .as_str()
+                .context("footprint attr contains a non-atom")?;
+            if !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_string());
+            }
+        }
+    }
+    for token in instance_tokens {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    if tokens.is_empty() {
+        return Ok(replacement.to_string());
+    }
+    replace_or_append_single_child(
+        replacement,
+        "footprint",
+        "attr",
+        &format!("(attr {})", tokens.join(" ")),
+    )
+}
+
+fn closed_footprint_invariant(
+    footprint: &str,
+    library_children: &[RawChild],
+) -> Result<ClosedFootprintInvariant> {
+    let root = konnect_sexp::parse_sexp(footprint)?;
+    let reference = raw_footprint_reference(&root).context("footprint has no Reference")?;
+    let children = raw_direct_children(footprint, "footprint")?;
+    let protected_properties = children_named(&children, "property")
+        .into_iter()
+        .map(|block| Ok((property_name(&block)?, block)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut pads = unique_pads(&children_named(&children, "pad"), "footprint")?
+        .into_iter()
+        .map(|(number, block)| {
+            Ok(ClosedPadInvariant {
+                number,
+                net: direct_child_block(&block, "pad", "net")?,
+                uuid: direct_child_block(&block, "pad", "uuid")?
+                    .or(direct_child_block(&block, "pad", "tstamp")?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pads.sort_by(|left, right| left.number.cmp(&right.number));
+    let points = if library_children.is_empty() {
+        children_named(&children, "point")
+    } else {
+        let expected = children_named(library_children, "point");
+        let actual = children_named(&children, "point");
+        if actual.len() != expected.len()
+            || match_existing_points(&reference, &actual, &expected)?.len() != actual.len()
+        {
+            bail!("footprint '{reference}' did not preserve every library point semantically");
+        }
+        actual
+    };
+    Ok(ClosedFootprintInvariant {
+        reference,
+        footprint_uuid: exactly_one_child(&children, "uuid", "footprint")?,
+        placement: exactly_one_child(&children, "at", "footprint")?,
+        layer: exactly_one_child(&children, "layer", "footprint")?,
+        protected_properties,
+        pads,
+        points,
+    })
+}
+
+fn verify_closed_board_invariants(
+    board: &str,
+    invariants: &[ClosedFootprintInvariant],
+) -> Result<()> {
+    let root = konnect_sexp::parse_sexp(board).context("written board is invalid S-expression")?;
+    if root.head() != Some("kicad_pcb") {
+        bail!("written document root is not kicad_pcb");
+    }
+    let blocks = find_direct_child_blocks(board, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let block = &board[start..end];
+            let node = konnect_sexp::parse_sexp(block).ok()?;
+            (node.head() == Some("footprint")).then(|| block.to_string())
+        })
+        .collect::<Vec<_>>();
+    for expected in invariants {
+        let matching = blocks
+            .iter()
+            .filter(|block| {
+                konnect_sexp::parse_sexp(block)
+                    .ok()
+                    .and_then(|root| raw_footprint_reference(&root))
+                    .as_deref()
+                    == Some(expected.reference.as_str())
+            })
+            .collect::<Vec<_>>();
+        let [block] = matching.as_slice() else {
+            bail!(
+                "readback contains {} footprints named '{}'",
+                matching.len(),
+                expected.reference
+            );
+        };
+        let actual = closed_footprint_invariant(block, &[])?;
+        if &actual != expected {
+            bail!(
+                "readback of footprint '{}' does not match the planned identity, placement, fields, pads, nets, UUIDs, and point children",
+                expected.reference
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum ClosedPersistFailure {
+    BeforeMutation(String),
+    RolledBack(String),
+    Uncertain(String),
+}
+
+fn persist_closed_board_plan(
+    board_path: &Path,
+    plan: &ClosedBoardPlan,
+) -> std::result::Result<(), ClosedPersistFailure> {
+    persist_closed_board_plan_with(board_path, plan, |readback| {
+        verify_closed_board_invariants(readback, &plan.invariants)
+    })
+}
+
+fn persist_closed_board_plan_with(
+    board_path: &Path,
+    plan: &ClosedBoardPlan,
+    verify: impl FnOnce(&str) -> Result<()>,
+) -> std::result::Result<(), ClosedPersistFailure> {
+    persist_closed_board_plan_with_hooks(board_path, plan, || {}, verify)
+}
+
+fn persist_closed_board_plan_with_hooks(
+    board_path: &Path,
+    plan: &ClosedBoardPlan,
+    after_write: impl FnOnce(),
+    verify: impl FnOnce(&str) -> Result<()>,
+) -> std::result::Result<(), ClosedPersistFailure> {
+    if let Err(error) = write_atomic_if_unchanged(board_path, &plan.original, &plan.replacement) {
+        let observed = std::fs::read_to_string(board_path).ok();
+        return if observed.as_deref() == Some(plan.original.as_str()) {
+            Err(ClosedPersistFailure::BeforeMutation(format!("{error:#}")))
+        } else {
+            Err(ClosedPersistFailure::Uncertain(format!(
+                "atomic replacement returned an error and the board is not byte-identical to the preflight source: {error:#}"
+            )))
+        };
+    }
+    after_write();
+    let readback = match read_consistent(board_path) {
+        Ok(readback) => readback,
+        Err(error) => {
+            return Err(ClosedPersistFailure::Uncertain(format!(
+                "the board was replaced but could not be read back: {error:#}"
+            )))
+        }
+    };
+    if readback != plan.replacement {
+        return Err(ClosedPersistFailure::Uncertain(
+            "the post-write readback differs from the planned replacement; Konnect preserved the observed bytes because they may belong to another writer"
+                .to_string(),
+        ));
+    }
+    let verification = verify(&readback);
+    let Err(reason) = verification else {
+        return Ok(());
+    };
+
+    match write_atomic_if_unchanged(board_path, &plan.replacement, &plan.original) {
+        Ok(()) => match read_consistent(board_path) {
+            Ok(rolled_back) if rolled_back == plan.original => Err(ClosedPersistFailure::RolledBack(
+                format!(
+                    "post-write verification failed ({reason:#}); the original bytes were restored and read back"
+                ),
+            )),
+            Ok(_) => Err(ClosedPersistFailure::Uncertain(format!(
+                "post-write verification failed ({reason:#}); rollback returned success but original bytes were not read back"
+            ))),
+            Err(error) => Err(ClosedPersistFailure::Uncertain(format!(
+                "post-write verification failed ({reason:#}); rollback could not be read back: {error:#}"
+            ))),
+        },
+        Err(error) => Err(ClosedPersistFailure::Uncertain(format!(
+            "post-write verification failed ({reason:#}) and compare-and-swap rollback failed: {error:#}"
+        ))),
+    }
 }
 
 fn plan_updates(
@@ -770,7 +2382,9 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     })
 }
 
-fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
+pub(crate) fn parse_library_properties(
+    root: &konnect_sexp::SexpNode,
+) -> Result<ParsedLibraryProperties> {
     let mut names = BTreeSet::new();
     let mut datasheet = None;
     let mut description = None;
@@ -809,6 +2423,18 @@ fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibra
     })
 }
 
+pub(crate) fn parse_typed_library_fields(
+    root: &konnect_sexp::SexpNode,
+) -> Result<Vec<kiapi::board::types::Field>> {
+    root.find_all("property")
+        .into_iter()
+        .map(|property| {
+            parse_library_property(property, true)?
+                .context("library property did not produce a typed field")
+        })
+        .collect()
+}
+
 /// Convert a footprint property into the typed `Field` shape carried by
 /// KiCad's IPC model. Mandatory properties are validated through this same
 /// path and then stored in their existing first-class fields. Unknown clauses
@@ -833,6 +2459,8 @@ fn parse_library_property(
     let mut layer = None;
     let mut hidden = None;
     let mut knockout = None;
+    let mut unlocked = None;
+    let mut locked = None;
     let mut attributes = None;
     let mut identifier = None;
 
@@ -846,8 +2474,10 @@ fn parse_library_property(
                     bail!("property '{name}' contains duplicate 'at' clauses");
                 }
                 let count = clause.children().map_or(0, |children| children.len());
-                if !matches!(count, 3 | 4) {
-                    bail!("property '{name}' 'at' must contain x, y, and optional rotation");
+                if !(3..=5).contains(&count) {
+                    bail!(
+                        "property '{name}' 'at' must contain x, y, optional rotation, and optional legacy unlocked"
+                    );
                 }
                 let x = clause
                     .get_f64(1)
@@ -855,7 +2485,22 @@ fn parse_library_property(
                 let y = clause
                     .get_f64(2)
                     .with_context(|| format!("property '{name}' has an invalid Y position"))?;
-                rotation = clause.get_f64(3).unwrap_or(0.0);
+                let third = clause.get(3).and_then(konnect_sexp::SexpNode::as_str);
+                rotation = match third {
+                    None | Some("unlocked") => 0.0,
+                    Some(_) => clause
+                        .get_f64(3)
+                        .with_context(|| format!("property '{name}' rotation is invalid"))?,
+                };
+                let legacy_unlocked = third == Some("unlocked")
+                    || clause.get(4).and_then(konnect_sexp::SexpNode::as_str) == Some("unlocked");
+                if legacy_unlocked {
+                    if unlocked.replace(true).is_some() {
+                        bail!("property '{name}' repeats unlocked state");
+                    }
+                } else if count == 5 {
+                    bail!("property '{name}' legacy 'at' tail must be unlocked");
+                }
                 if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
                     bail!("property '{name}' position and rotation must be finite");
                 }
@@ -890,6 +2535,18 @@ fn parse_library_property(
                     bail!("property '{name}' contains duplicate 'knockout' clauses");
                 }
                 knockout = Some(property_yes_no(clause, name, "knockout")?);
+            }
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
+            }
+            "locked" => {
+                if locked.is_some() {
+                    bail!("property '{name}' contains duplicate 'locked' clauses");
+                }
+                locked = Some(property_yes_no(clause, name, "locked")?);
             }
             "uuid" | "tstamp" => {
                 if let Some(previous) = identifier {
@@ -932,6 +2589,7 @@ fn parse_library_property(
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
+    attributes.keep_upright = !unlocked.unwrap_or(false);
     Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
@@ -947,7 +2605,11 @@ fn parse_library_property(
             }),
             layer,
             knockout: knockout.unwrap_or(false),
-            locked: LockedState::LsUnlocked as i32,
+            locked: if locked.unwrap_or(false) {
+                LockedState::LsLocked as i32
+            } else {
+                LockedState::LsUnlocked as i32
+            },
             parent: None,
         }),
         visible: !hidden.unwrap_or(false),
@@ -1133,7 +2795,7 @@ fn parse_property_effects(
     })
 }
 
-fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
+pub(crate) fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
     for child in root.children().unwrap_or_default().iter().skip(2) {
         let Some(tag) = child.head() else {
             continue;
@@ -1687,7 +3349,7 @@ fn merge_custom_properties(
     Ok(())
 }
 
-fn transform_library_property(
+pub(crate) fn transform_library_property(
     property: &kiapi::board::types::Field,
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
@@ -2797,13 +4459,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(render_cache legacy)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("render_cache"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2828,7 +4490,7 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(render_cache legacy)\n\t\t(at"),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2836,7 +4498,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("render_cache"), "{message}");
                 }
             }
 
@@ -3194,7 +4856,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(render_cache legacy)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3216,7 +4878,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("render_cache")
         }));
     }
 
@@ -3468,6 +5130,10 @@ mod tests {
             true
         );
         assert_eq!(
+            definition.input_schema["properties"]["allow_closed_board_file"]["default"],
+            false
+        );
+        assert_eq!(
             definition.input_schema["properties"]["references"]["items"]["type"],
             "string"
         );
@@ -3475,6 +5141,31 @@ mod tests {
             definition.input_schema["properties"]["library_ids"]["items"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn live_refusal_preserves_uncertain_and_recovered_outcomes_without_preflight_relabeling() {
+        let uncertain = refused_live_update_result(crate::tools::ipc_uncertain_result(
+            "update may have reached KiCad",
+        ));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&uncertain).as_deref(),
+            Some("ipc_outcome_unknown")
+        );
+        assert!(uncertain.is_error);
+
+        let recovered = refused_live_update_result(crate::tools::ipc_recovered_result(
+            "late update was dropped",
+        ));
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&recovered).as_deref(),
+            Some("ipc_batch_recovered")
+        );
+        assert!(recovered.is_error);
+
+        let ordinary = refused_live_update_result(CallToolResult::error("preflight rejected"));
+        assert_eq!(result_json(&ordinary)["status"], "conflict");
+        assert!(!ordinary.is_error);
     }
 
     #[tokio::test]
@@ -3523,8 +5214,180 @@ mod tests {
         assert!(response["diagnostics"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("live-IPC-only"));
+            .contains("saved-file path was not enabled"));
         assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn explicit_closed_board_mode_plans_rejects_stale_and_applies_with_readback() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        let board_source = format!("(kicad_pcb\n\t(version 20240108)\n\t{}\n)\n", CLOSED_PLACED);
+        std::fs::write(&board, &board_source).unwrap();
+        let library_dir = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library_dir).unwrap();
+        std::fs::write(library_dir.join("LED_D5.0mm.kicad_mod"), CLOSED_LIBRARY).unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let context = test_context("");
+        let args = serde_json::json!({
+            "board": board,
+            "references": ["D1"],
+            "allow_closed_board_file": true
+        });
+        let dry_run = handle_update_footprints_from_library(&args, &context)
+            .await
+            .unwrap();
+        let dry_run = result_json(&dry_run);
+        assert_eq!(dry_run["status"], "ready");
+        assert_eq!(dry_run["coverage"]["transport"], "closed_board_file");
+        assert_eq!(dry_run["target"]["source"], "saved_file");
+        let revision = dry_run["plan_revision"].as_str().unwrap().to_string();
+
+        let board_b = temp.path().join("board-b.kicad_pcb");
+        std::fs::write(&board_b, &board_source).unwrap();
+        let wrong_target = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board_b,
+                "references": ["D1"],
+                "allow_closed_board_file": true,
+                "dry_run": false,
+                "expected_plan_revision": revision.clone()
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result_json(&wrong_target)["diagnostics"][0]["code"],
+            "stale_plan_revision"
+        );
+        assert_eq!(std::fs::read_to_string(&board_b).unwrap(), board_source);
+
+        let stale = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "references": ["D1"],
+                "allow_closed_board_file": true,
+                "dry_run": false,
+                "expected_plan_revision": "stale"
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result_json(&stale)["diagnostics"][0]["code"],
+            "stale_plan_revision"
+        );
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), board_source);
+
+        let applied = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "references": ["D1"],
+                "allow_closed_board_file": true,
+                "dry_run": false,
+                "expected_plan_revision": revision
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let applied = result_json(&applied);
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["coverage"]["changed"]["applied"], 1);
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert!(written.contains("(point"));
+        assert!(written.contains("(net \"GND\")"));
+        assert!(written.contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+
+        if std::process::Command::new("kicad-cli")
+            .arg("version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            let report = temp.path().join("closed-refresh-drc.json");
+            let output = std::process::Command::new("kicad-cli")
+                .args(["pcb", "drc", "--format", "json", "--output"])
+                .arg(&report)
+                .arg(&board)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "kicad-cli rejected the engine-written board: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(report.is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_board_preflight_failure_reports_closed_source_and_unchanged_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("invalid.kicad_pcb");
+        let before = "(not_a_board)\n";
+        std::fs::write(&board, before).unwrap();
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "allow_closed_board_file": true
+            }),
+            &test_context(""),
+        )
+        .await
+        .unwrap();
+        let response = result_json(&result);
+        assert_eq!(response["status"], "conflict");
+        assert_eq!(response["coverage"]["transport"], "closed_board_file");
+        assert_eq!(
+            response["coverage"]["atomicity"],
+            "compare_and_swap_atomic_replace_with_readback_and_rollback"
+        );
+        assert_eq!(response["recovery"], "unchanged");
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "closed_board_preflight_conflict"
+        );
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_board_symlink_target_is_refused_without_replacing_the_link_or_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real.kicad_pcb");
+        let alias = temp.path().join("alias.kicad_pcb");
+        let before = "(kicad_pcb (version 20240108))\n";
+        std::fs::write(&real, before).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": alias,
+                "allow_closed_board_file": true
+            }),
+            &test_context(""),
+        )
+        .await
+        .unwrap();
+        let response = result_json(&result);
+        assert_eq!(response["status"], "conflict");
+        assert!(response["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is a symlink"));
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(real).unwrap(), before);
     }
 
     #[derive(Default)]
@@ -3558,6 +5421,26 @@ mod tests {
         }
     }
 
+    fn planner_live_source(footprint: &prost_types::Any) -> String {
+        let footprint = kiapi::board::types::FootprintInstance::decode(footprint.value.as_slice())
+            .expect("planner fixture footprint");
+        let kiid = footprint.id.as_ref().unwrap().value.as_str();
+        let reference = field_text(&footprint.reference_field);
+        let library_id = footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+            .unwrap();
+        let position = footprint.position.as_ref().unwrap();
+        let rotation = footprint.orientation.as_ref().unwrap().value_degrees;
+        format!(
+            "(kicad_pcb (version 20240108) (footprint \"{library_id}\" (layer \"F.Cu\") (uuid \"{kiid}\") (at {} {} {rotation}) (property \"Reference\" \"{reference}\" (at 0 0 0) (layer \"F.SilkS\") (effects (font (size 1 1))))))",
+            builders::nm_to_mm(position.x_nm),
+            builders::nm_to_mm(position.y_nm),
+        )
+    }
+
     fn spawn_planner_mock(
         board: &Path,
         footprint: prost_types::Any,
@@ -3577,6 +5460,16 @@ mod tests {
         socket.listen(&url).unwrap();
 
         let board_name = board.to_string_lossy().to_string();
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    board_name.clone(),
+                ),
+            ),
+            project: None,
+        };
+        let live_source = planner_live_source(&footprint);
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
@@ -3586,15 +5479,7 @@ mod tests {
                 let response = if message.type_url.ends_with("GetOpenDocuments") {
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board_name.clone(),
-                                    ),
-                                ),
-                                project: None,
-                            }],
+                            documents: vec![document.clone()],
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
                     ))
@@ -3623,6 +5508,19 @@ mod tests {
                             nets: vec![builders::net("ROW1", 11), builders::net("COL1", 12)],
                         },
                         "kiapi.board.commands.NetsResponse",
+                    ))
+                } else if message.type_url.ends_with("SaveDocumentToString") {
+                    let command = kiapi::common::commands::SaveDocumentToString::decode(
+                        message.value.as_slice(),
+                    )
+                    .unwrap();
+                    assert_eq!(command.document, Some(document.clone()));
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: Some(document.clone()),
+                            contents: live_source.clone(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
                     ))
                 } else if message.type_url.ends_with("BeginCommit") {
                     captured.lock().unwrap().begin_count += 1;
@@ -3796,5 +5694,462 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+
+    const CLOSED_LIBRARY: &str = r#"(footprint "LED_D5.0mm"
+	(version 20260206)
+	(generator "kicad-footprint-generator")
+	(layer "F.Cu")
+	(property "Reference" "REF**" (at 1.27 -3.96 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+	(property "Value" "LED_D5.0mm" (at 1.27 3.96 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+	(property "KiLib_Generator" "LED/THT" (at 0 0 0) (layer "F.SilkS") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
+	(attr through_hole)
+	(fp_circle (center 1.27 0) (end 3.77 0) (stroke (width 0.1) (type solid)) (fill no) (layer "F.Fab"))
+	(fp_text user "${REFERENCE}" (at 1.27 0 0) (layer "F.Fab") (effects (font (size 0.8 0.8) (thickness 0.12))))
+	(pad "1" thru_hole rect (at 0 0) (size 1.8 1.8) (drill 0.9) (layers "*.Cu" "*.Mask") (remove_unused_layers no))
+	(pad "2" thru_hole circle (at 2.54 0) (size 1.8 1.8) (drill 0.9) (layers "*.Cu" "*.Mask") (remove_unused_layers no))
+	(point
+		(at 1.27 0)
+		(size 2)
+		(layer "F.Fab")
+	)
+	(embedded_fonts no)
+)"#;
+
+    const CLOSED_PLACED: &str = r#"(footprint "Test:LED_D5.0mm"
+	(layer "F.Cu")
+	(uuid "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	(at 132 108 180)
+	(locked yes)
+	(property "Reference" "D1" (at 1.27 -3.96 180) (layer "F.SilkS") (uuid "11111111-1111-4111-8111-111111111111") (effects (font (size 1 1))))
+	(property "Value" "LED" (at 1.27 3.96 180) (layer "F.Fab") (uuid "22222222-2222-4222-8222-222222222222") (effects (font (size 1 1))))
+	(property "InstanceNote" "keep" (at 0 0 180) (layer "F.Fab") (uuid "33333333-3333-4333-8333-333333333333") (effects (font (size 1 1))))
+	(path "/90e64816-9539-4b62-9d79-d001045cf4b3")
+	(units (unit (name "A") (pins "1" "2")))
+	(attr through_hole dnp)
+	(fp_circle (center 1.27 0) (end 3.77 0) (stroke (width 0.1) (type solid)) (fill no) (layer "F.Fab") (uuid "44444444-4444-4444-8444-444444444444"))
+	(fp_text user "${REFERENCE}" (at 1.27 0 180) (unlocked yes) (layer "F.Fab") (uuid "77777777-7777-4777-8777-777777777777") (effects (font (size 0.8 0.8) (thickness 0.12))))
+	(pad "1" thru_hole rect (at 0 0 180) (size 1.8 1.8) (drill 0.9) (layers "*.Cu" "*.Mask") (remove_unused_layers no) (locked yes) (zone_layer_connections) (net "GND") (pinfunction "K") (pintype "passive") (uuid "55555555-5555-4555-8555-555555555555"))
+	(pad "2" thru_hole circle (at 2.54 0 180) (size 1.8 1.8) (drill 0.9) (layers "*.Cu" "*.Mask") (remove_unused_layers no) (net "Net-(D1-A)") (uuid "66666666-6666-4666-8666-666666666666"))
+	(embedded_fonts no)
+)"#;
+
+    #[test]
+    fn closed_board_refresh_preserves_instance_state_and_complete_point_bytes() {
+        let path = std::path::Path::new("/tmp/Test.pretty/LED_D5.0mm.kicad_mod");
+        let prepared =
+            prepare_closed_board_footprint(CLOSED_PLACED, "Test:LED_D5.0mm", CLOSED_LIBRARY, path)
+                .unwrap();
+
+        let replacement = &prepared.replacement;
+        assert!(replacement.contains("(uuid \"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\")"));
+        assert!(replacement.contains("(at 132 108 180)"));
+        assert!(replacement.contains("(locked yes)"));
+        assert!(replacement.contains("(path \"/90e64816-9539-4b62-9d79-d001045cf4b3\")"));
+        assert!(replacement.contains("(units (unit (name \"A\") (pins \"1\" \"2\")))"));
+        assert!(replacement.contains("(property \"InstanceNote\" \"keep\""));
+        assert!(replacement.contains("(net \"GND\")"));
+        assert!(replacement.contains("(uuid \"55555555-5555-4555-8555-555555555555\")"));
+        assert!(replacement.contains("(attr through_hole dnp)"));
+
+        let library_points = children_named(
+            &raw_direct_children(CLOSED_LIBRARY, "footprint").unwrap(),
+            "point",
+        );
+        let written_points = children_named(
+            &raw_direct_children(replacement, "footprint").unwrap(),
+            "point",
+        );
+        assert_eq!(written_points, library_points, "point bytes must be exact");
+        assert_eq!(written_points.len(), 1);
+        closed_footprint_invariant(
+            replacement,
+            &raw_direct_children(CLOSED_LIBRARY, "footprint").unwrap(),
+        )
+        .unwrap();
+
+        let old_children = raw_direct_children(CLOSED_PLACED, "footprint").unwrap();
+        let new_children = raw_direct_children(replacement, "footprint").unwrap();
+        let old_text = children_named(&old_children, "fp_text");
+        let new_text = children_named(&new_children, "fp_text");
+        assert_eq!(new_text, old_text, "fp_text user must be byte-identical");
+        let named_property = |children: &[RawChild], name: &str| {
+            children_named(children, "property")
+                .into_iter()
+                .find(|block| property_name(block).ok().as_deref() == Some(name))
+                .unwrap()
+        };
+        assert_eq!(
+            named_property(&new_children, "InstanceNote"),
+            named_property(&old_children, "InstanceNote"),
+            "instance-only property must be byte-identical"
+        );
+        let old_pad = unique_pads(&children_named(&old_children, "pad"), "old")
+            .unwrap()
+            .remove("1")
+            .unwrap();
+        let new_pad = unique_pads(&children_named(&new_children, "pad"), "new")
+            .unwrap()
+            .remove("1")
+            .unwrap();
+        for tag in [
+            "locked",
+            "zone_layer_connections",
+            "net",
+            "pinfunction",
+            "pintype",
+            "uuid",
+        ] {
+            assert_eq!(
+                direct_child_block(&new_pad, "pad", tag).unwrap(),
+                direct_child_block(&old_pad, "pad", tag).unwrap(),
+                "pad child '{tag}' must be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_kicad_led_point_survives_the_closed_board_engine_byte_exact() {
+        let path = std::path::Path::new(
+            "/opt/kicad/10.0.6/share/kicad/footprints/LED_THT.pretty/LED_D5.0mm.kicad_mod",
+        );
+        let Ok(source) = std::fs::read_to_string(path) else {
+            eprintln!("SKIP: {} is not installed", path.display());
+            return;
+        };
+        let mut placed = super::super::pcb_components::board_footprint_sexp_from_source(
+            &source,
+            "LED_THT:LED_D5.0mm",
+            path,
+            132.0,
+            108.0,
+            180.0,
+            "F.Cu",
+            Some("D1"),
+        )
+        .unwrap();
+        let point = children_named(&raw_direct_children(&placed, "footprint").unwrap(), "point")
+            .into_iter()
+            .next()
+            .expect("installed KiCad 10.0.6 LED footprint has point");
+        let point_index = raw_direct_children(&placed, "footprint")
+            .unwrap()
+            .iter()
+            .filter(|child| child.tag == "point")
+            .count();
+        assert_eq!(point_index, 1);
+        let (start, end) = find_direct_child_blocks(&placed, "footprint")
+            .into_iter()
+            .find(|(start, end)| {
+                konnect_sexp::parse_sexp(&placed[*start..*end])
+                    .ok()
+                    .is_some_and(|node| node.head() == Some("point"))
+            })
+            .unwrap();
+        placed = apply_edits(placed, vec![SexpEdit::delete(start, end)]);
+
+        let prepared =
+            prepare_closed_board_footprint(&placed, "LED_THT:LED_D5.0mm", &source, path).unwrap();
+        let restored = children_named(
+            &raw_direct_children(&prepared.replacement, "footprint").unwrap(),
+            "point",
+        );
+        assert_eq!(restored, vec![point]);
+    }
+
+    #[test]
+    fn kicad_reserialized_point_keeps_its_board_uuid_across_refresh() {
+        let current = CLOSED_PLACED.replace(
+            "\t(embedded_fonts no)",
+            "\t(point (at 1.270001 0) (size 2) (layer \"F.Fab\") (uuid \"dddddddd-dddd-4ddd-8ddd-dddddddddddd\"))\n\t(embedded_fonts no)",
+        );
+        let prepared = prepare_closed_board_footprint(
+            &current,
+            "Test:LED_D5.0mm",
+            CLOSED_LIBRARY,
+            std::path::Path::new("/tmp/Test.pretty/LED_D5.0mm.kicad_mod"),
+        )
+        .unwrap();
+        let points = children_named(
+            &raw_direct_children(&prepared.replacement, "footprint").unwrap(),
+            "point",
+        );
+        assert_eq!(points.len(), 1);
+        assert_eq!(
+            direct_child_block(&points[0], "point", "uuid")
+                .unwrap()
+                .unwrap(),
+            "(uuid \"dddddddd-dddd-4ddd-8ddd-dddddddddddd\")"
+        );
+    }
+
+    #[test]
+    fn closed_board_refresh_refuses_back_side_duplicate_pads_and_user_graphics() {
+        let path = std::path::Path::new("/tmp/Test.pretty/LED_D5.0mm.kicad_mod");
+        let back = CLOSED_PLACED.replacen("(layer \"F.Cu\")", "(layer \"B.Cu\")", 1);
+        let error = prepare_closed_board_footprint(&back, "Test:LED_D5.0mm", CLOSED_LIBRARY, path)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("supports F.Cu only"));
+
+        let duplicate = CLOSED_LIBRARY.replace(
+            "\t(pad \"2\" thru_hole circle",
+            "\t(pad \"1\" thru_hole circle",
+        );
+        let error =
+            prepare_closed_board_footprint(CLOSED_PLACED, "Test:LED_D5.0mm", &duplicate, path)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate pad number '1'"));
+
+        let user_graphic = CLOSED_PLACED.replace(
+            "\t(pad \"1\"",
+            "\t(fp_line (start 0 0) (end 1 1) (stroke (width 0.1) (type solid)) (layer \"F.SilkS\") (uuid \"77777777-7777-4777-8777-777777777777\"))\n\t(pad \"1\"",
+        );
+        let error =
+            prepare_closed_board_footprint(&user_graphic, "Test:LED_D5.0mm", CLOSED_LIBRARY, path)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("ownership is ambiguous"));
+
+        let same_count_library = CLOSED_LIBRARY.replace(
+            "\t(fp_circle",
+            "\t(fp_line (start 10 10) (end 11 11) (stroke (width 0.1) (type solid)) (layer \"F.SilkS\"))\n\t(fp_circle",
+        );
+        let same_count_user = CLOSED_PLACED.replace(
+            "\t(fp_circle",
+            "\t(fp_line (start 20 20) (end 21 21) (stroke (width 0.1) (type solid)) (layer \"F.SilkS\") (uuid \"99999999-9999-4999-8999-999999999999\"))\n\t(fp_circle",
+        );
+        let error = prepare_closed_board_footprint(
+            &same_count_user,
+            "Test:LED_D5.0mm",
+            &same_count_library,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("ownership is ambiguous"));
+
+        let changed_user_text = CLOSED_LIBRARY.replace("${REFERENCE}", "LIBRARY_REFERENCE");
+        let error = prepare_closed_board_footprint(
+            CLOSED_PLACED,
+            "Test:LED_D5.0mm",
+            &changed_user_text,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("different fp_text user identities"));
+
+        let added_user_text = CLOSED_LIBRARY.replace(
+            "\t(pad \"1\"",
+            "\t(fp_text user \"NEW_LIBRARY_NOTE\" (at 0 0 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))\n\t(pad \"1\"",
+        );
+        let error = prepare_closed_board_footprint(
+            CLOSED_PLACED,
+            "Test:LED_D5.0mm",
+            &added_user_text,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("different fp_text user identities"));
+
+        let grouped = CLOSED_LIBRARY.replace(
+            "\t(embedded_fonts no)",
+            "\t(group \"Fab\" (uuid \"88888888-8888-4888-8888-888888888888\") (members \"44444444-4444-4444-8444-444444444444\"))\n\t(embedded_fonts no)",
+        );
+        let error =
+            prepare_closed_board_footprint(CLOSED_PLACED, "Test:LED_D5.0mm", &grouped, path)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot yet remap group member UUIDs"));
+
+        let grouped_current = CLOSED_PLACED.replace(
+            "\t(embedded_fonts no)",
+            "\t(group \"BoardOnly\" (uuid \"abababab-abab-4bab-8bab-abababababab\") (members \"44444444-4444-4444-8444-444444444444\"))\n\t(embedded_fonts no)",
+        );
+        let error = prepare_closed_board_footprint(
+            &grouped_current,
+            "Test:LED_D5.0mm",
+            CLOSED_LIBRARY,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot yet remap group member UUIDs"));
+
+        let point = children_named(
+            &raw_direct_children(CLOSED_LIBRARY, "footprint").unwrap(),
+            "point",
+        )[0]
+        .clone();
+        let duplicate_point = CLOSED_PLACED.replace(
+            "\t(embedded_fonts no)",
+            &format!("\t{point}\n\t{point}\n\t(embedded_fonts no)"),
+        );
+        let error = prepare_closed_board_footprint(
+            &duplicate_point,
+            "Test:LED_D5.0mm",
+            CLOSED_LIBRARY,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("point ownership is ambiguous"));
+    }
+
+    #[test]
+    fn closed_board_refresh_refuses_removing_a_connected_pad() {
+        let path = std::path::Path::new("/tmp/Test.pretty/LED_D5.0mm.kicad_mod");
+        let without_pad_two = CLOSED_LIBRARY.replace(
+            "\t(pad \"2\" thru_hole circle (at 2.54 0) (size 1.8 1.8) (drill 0.9) (layers \"*.Cu\" \"*.Mask\") (remove_unused_layers no))\n",
+            "",
+        );
+        let error = prepare_closed_board_footprint(
+            CLOSED_PLACED,
+            "Test:LED_D5.0mm",
+            &without_pad_two,
+            path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("removes connected pad 2"));
+    }
+
+    #[test]
+    fn new_library_child_uuids_are_deterministic_and_instance_unique() {
+        let path = std::path::Path::new("/tmp/Test.pretty/LED_D5.0mm.kicad_mod");
+        let library = CLOSED_LIBRARY.replace(
+            "\t(pad \"1\"",
+            "\t(fp_line (start 10 10) (end 11 11) (stroke (width 0.1) (type solid)) (layer \"F.SilkS\") (uuid \"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\"))\n\t(pad \"1\"",
+        );
+        let first =
+            prepare_closed_board_footprint(CLOSED_PLACED, "Test:LED_D5.0mm", &library, path)
+                .unwrap();
+        let second_current = CLOSED_PLACED
+            .replace(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+            .replace("\"D1\"", "\"D2\"");
+        let second =
+            prepare_closed_board_footprint(&second_current, "Test:LED_D5.0mm", &library, path)
+                .unwrap();
+        let new_uuid = |replacement: &str| {
+            let line = children_named(
+                &raw_direct_children(replacement, "footprint").unwrap(),
+                "fp_line",
+            )
+            .into_iter()
+            .next()
+            .unwrap();
+            direct_child_block(&line, "fp_line", "uuid")
+                .unwrap()
+                .unwrap()
+        };
+        let first_uuid = new_uuid(&first.replacement);
+        let second_uuid = new_uuid(&second.replacement);
+        assert_ne!(first_uuid, second_uuid);
+        assert!(!first_uuid.contains("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
+        assert!(!second_uuid.contains("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn post_write_verification_failure_restores_and_reads_back_original_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("rollback.kicad_pcb");
+        let original = "(kicad_pcb (version 20240108))\n".to_string();
+        let replacement = "(kicad_pcb (version 20240108) (generator pcbnew))\n".to_string();
+        std::fs::write(&board, &original).unwrap();
+        let plan = ClosedBoardPlan {
+            target_path: board.display().to_string(),
+            status: PlanStatus::Ready,
+            plan_revision: "test".to_string(),
+            coverage: UpdateCoverage::default(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+            original: original.clone(),
+            replacement,
+            invariants: Vec::new(),
+        };
+
+        let result = persist_closed_board_plan_with(&board, &plan, |_| {
+            anyhow::bail!("injected post-write verifier failure")
+        });
+        assert!(matches!(result, Err(ClosedPersistFailure::RolledBack(_))));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), original);
+    }
+
+    #[test]
+    fn post_write_external_change_is_preserved_instead_of_rolled_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("post-write-race.kicad_pcb");
+        let original = "(kicad_pcb (version 20240108))\n".to_string();
+        let replacement = "(kicad_pcb (version 20240108) (generator konnect))\n".to_string();
+        let external = "(kicad_pcb (version 20240108) (generator external))\n".to_string();
+        std::fs::write(&board, &original).unwrap();
+        let plan = ClosedBoardPlan {
+            target_path: board.display().to_string(),
+            status: PlanStatus::Ready,
+            plan_revision: "test".to_string(),
+            coverage: UpdateCoverage::default(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+            original,
+            replacement,
+            invariants: Vec::new(),
+        };
+
+        let result = persist_closed_board_plan_with_hooks(
+            &board,
+            &plan,
+            || std::fs::write(&board, &external).unwrap(),
+            |_| Ok(()),
+        );
+        assert!(matches!(result, Err(ClosedPersistFailure::Uncertain(_))));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), external);
+    }
+
+    #[test]
+    fn pre_rollback_external_change_is_preserved_by_compare_and_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("pre-rollback-race.kicad_pcb");
+        let original = "(kicad_pcb (version 20240108))\n".to_string();
+        let replacement = "(kicad_pcb (version 20240108) (generator konnect))\n".to_string();
+        let external = "(kicad_pcb (version 20240108) (generator external))\n".to_string();
+        std::fs::write(&board, &original).unwrap();
+        let plan = ClosedBoardPlan {
+            target_path: board.display().to_string(),
+            status: PlanStatus::Ready,
+            plan_revision: "test".to_string(),
+            coverage: UpdateCoverage::default(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+            original,
+            replacement,
+            invariants: Vec::new(),
+        };
+
+        let result = persist_closed_board_plan_with(&board, &plan, |_| {
+            std::fs::write(&board, &external).unwrap();
+            anyhow::bail!("injected verifier failure after an external write")
+        });
+        assert!(matches!(result, Err(ClosedPersistFailure::Uncertain(_))));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), external);
+    }
+
+    #[test]
+    fn compare_and_swap_race_never_overwrites_external_bytes_and_reports_uncertain_phase() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("stale.kicad_pcb");
+        let original = "(kicad_pcb (version 20240108))\n".to_string();
+        let external = "(kicad_pcb (version 20240108) (generator external))\n".to_string();
+        std::fs::write(&board, &external).unwrap();
+        let plan = ClosedBoardPlan {
+            target_path: board.display().to_string(),
+            status: PlanStatus::Ready,
+            plan_revision: "test".to_string(),
+            coverage: UpdateCoverage::default(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+            original,
+            replacement: "(kicad_pcb (version 20240108) (generator konnect))\n".to_string(),
+            invariants: Vec::new(),
+        };
+
+        let result = persist_closed_board_plan(&board, &plan);
+        assert!(matches!(result, Err(ClosedPersistFailure::Uncertain(_))));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), external);
     }
 }

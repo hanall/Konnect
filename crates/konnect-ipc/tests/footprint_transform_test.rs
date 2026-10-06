@@ -224,6 +224,32 @@ fn spawn_footprints_mock_with_behavior(
                 &resp,
                 "kiapi.common.commands.GetOpenDocumentsResponse",
             )))
+        } else if msg.type_url.ends_with("SaveDocumentToString") {
+            let cmd = kiapi::common::commands::SaveDocumentToString::decode(msg.value.as_slice())
+                .unwrap();
+            // 이 fixture에는 native-only 객체가 없다. 같은 live 저장소의
+            // KIID를 snapshot에도 반영하고, 기하는 아래 UpdateItems 검사에서 검증한다.
+            let footprints = current_in_mock.lock().unwrap();
+            let contents = format!(
+                "(kicad_pcb {})",
+                footprints
+                    .iter()
+                    .map(|footprint| {
+                        format!(
+                            "(footprint Mock (uuid {:?}))",
+                            footprint.id.as_ref().unwrap().value
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::SavedDocumentResponse {
+                    document: cmd.document,
+                    contents,
+                },
+                "kiapi.common.commands.SavedDocumentResponse",
+            )))
         } else if msg.type_url.ends_with("GetItems") {
             let resp = kiapi::common::commands::GetItemsResponse {
                 header: None,
@@ -443,6 +469,9 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
     )
     .unwrap();
     r2.position = Some(builders::vec2(200.0, 100.0));
+    r2.id = Some(kiapi::common::types::Kiid {
+        value: "r2-kiid".to_string(),
+    });
     r2.reference_field
         .as_mut()
         .unwrap()

@@ -256,11 +256,10 @@ Claude Desktop's config lives at
 
 For Claude Code, put the same snippet in a `.mcp.json` in your project root.
 
-The macOS PCM package (`konnect-pcm-v<version>-macos.zip`) bundles a universal
-server binary, so one download covers Apple Silicon and Intel. The schematic
-viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
-WebView2 is only a Windows requirement) but hasn't had the same mileage as
-the Windows build yet.
+macOS PCM 패키지(`konnect-pcm-v<version>-macos.zip`)에는 Apple Silicon과 Intel을
+함께 지원하는 universal server binary가 들어 있습니다. Schematic viewer는
+별도 WebView runtime을 내장하지 않고 macOS 기본 브라우저를 엽니다. macOS에서도
+빌드하고 실행할 수 있지만 Windows판만큼 장기간 검증되지는 않았습니다.
 
 ## Setup with Claude Desktop
 
@@ -287,23 +286,40 @@ snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
 
 ## Schematic viewer
 
-A standalone viewer that auto-refreshes as the schematic file changes:
+Schematic 파일 변경을 감시하고 시스템 브라우저에서 자동 갱신하는 독립 실행형
+viewer입니다.
 
 ```bash
+# Windows
 schematic-viewer.exe path\to\your\root_schematic.kicad_sch
+
+# macOS / Linux
+schematic-viewer path/to/your/root_schematic.kicad_sch
 ```
 
-Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
-too, with a depth-indented sheet selector in the toolbar. Edits saved from KiCAD (or
-made by the AI through the schematic tools) re-render only the sheets that changed
-and refresh the view live — rendering runs against temp-folder snapshots, so the
-viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
-`0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
-by the AI via the `open_schematic_viewer` tool.
+계층 설계의 root sheet를 지정하면 프로젝트 디렉터리 안의 모든 sub-sheet를
+발견하고 깊이 들여쓴 selector로 표시합니다. 렌더링은 매번 권한이 격리된 임시
+snapshot에서 수행하며 live 설계 파일로 fallback하지 않습니다. 따라서
+`kicad-cli`가 KiCad의 저장을 가로막거나 원본을 변경하지 않습니다. 저장 이벤트가
+오면 변경된 sheet와 이전에 렌더링하지 못한 sheet만 다시 렌더링합니다. 클릭
+drag로 이동하고 mouse wheel로 확대·축소하며, `0`으로 화면 맞춤, `R`로 수동
+갱신, toolbar로 sheet·theme 전환과 KiCad 열기를 수행할 수 있습니다.
 
-Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
-`kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
-the main workspace — see [DEV.md](DEV.md) for build steps.
+viewer는 `127.0.0.1`의 OS 할당 random port에만 bind하고 256-bit capability
+token이 포함된 URL을 시스템 브라우저로 엽니다. Host·Origin·경로·request 크기를
+검사하며 외부 주소에는 bind하지 않습니다. `open_schematic_viewer` MCP tool은
+process spawn만으로 성공하지 않습니다. 브라우저가 page와 state, SVG를 받고
+실제로 image load를 끝낸 뒤 root snapshot render와 watcher가 준비된 경우에만
+`ready: true`, URL, viewer PID, sheet별 render health를 반환합니다.
+브라우저가 연결된 뒤 인증된 request가 120초 동안 없으면 viewer process가
+종료되므로 tab을 닫은 뒤 background server가 무기한 남지 않습니다. 동시에 여러
+viewer를 열면 각각 별도 port, token, cache, watcher를 사용합니다.
+
+별도 WebView2, GTK, WebKit runtime은 필요하지 않습니다. KiCad 설치에 포함된
+`kicad-cli`는 표준 설치 경로나 안전한 absolute PATH 항목에서 찾습니다. 필요하면
+`--kicad-cli <path-or-name>`으로 지정할 수 있습니다. 빈 PATH 항목이나 상대 PATH
+항목은 cwd fallback으로 사용하지 않습니다. viewer는 main Cargo workspace와
+분리되어 있으므로 빌드 방법은 [DEV.md](DEV.md)를 참조하십시오.
 
 ## Requirements
 

@@ -11,11 +11,11 @@ members = [
     "xtask",
 ]
 exclude = [
-    "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`
+    "crates/schematic-viewer",  # 별도 잠금 파일을 쓰는 loopback 브라우저 뷰어
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.13.0+hanall.1"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -41,9 +41,11 @@ axum = { version = "0.8", features = ["macros"] }
 # S-expression parsing
 nom = "8"
 
-# Specctra DSN/SES syntax. Konnect owns the KiCad lowering and manifest;
-# Topola supplies the format AST and serializer/parser used for parity checks.
-topola_specctra = "0.1.0"
+# Specctra DSN/SES syntax. Konnect owns a minimal parser/writer/schema derived
+# from Topola 0.1.0; the pinned derive and tokenizer crates preserve its exact
+# format behavior without pulling geometry convenience dependencies.
+specctra_derive = { package = "topola_specctra_derive", version = "=0.1.0" }
+utf8-chars = "=3.0.7"
 
 # NNG for KiCAD 10 IPC (nanomsg-next-gen, replaces ZeroMQ)
 nng = "1"

@@ -29,15 +29,15 @@ cargo build --release -p konnect # build the MCP server binary
 
 # Build the schematic viewer (separate crate)
 cd crates/schematic-viewer
-cargo build --release
+cargo build --release --locked
 ```
 
-Schematic-viewer build notes (Windows):
+Schematic-viewer 빌드 참고사항(Windows):
 
-- If `cargo` is not recognized in a fresh shell, add it to the session PATH first:
+- 새 shell에서 `cargo`를 찾지 못하면 session PATH에 먼저 추가합니다.
   `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`
-- Close any running viewer window before rebuilding — Windows locks a running
-  `.exe`, so the link step fails while the app is open.
+- 실행 중인 viewer process를 종료한 뒤 다시 빌드합니다. Windows는 실행 중인
+  `.exe`를 잠그므로 process가 남아 있으면 link 단계가 실패합니다.
 
 ### Nix
 
@@ -146,11 +146,14 @@ Konnect/
 │   │       │                         # children in ABSOLUTE board coords (#23)
 │   │       └── types.rs              # Public types (IpcFootprint, IpcTrack, etc.)
 │   │
-│   └── schematic-viewer/            # Tauri desktop app (separate from workspace)
-│       ├── tauri.conf.json
-│       ├── capabilities/default.json # Tauri 2 ACL grant (core:default) — without it event.listen() is silently denied
-│       ├── src/main.rs               # Multi-sheet watcher + snapshot-isolated incremental kicad-cli SVG rendering + Tauri commands, 20 unit tests
-│       └── frontend/index.html       # Pan/zoom SVG viewer, sheet selector, auto-refresh
+│   └── schematic-viewer/            # localhost browser viewer, workspace와 분리
+│       ├── src/hierarchy.rs          # project-bound hierarchy 탐색과 traversal/symlink 거부
+│       ├── src/render.rs             # 격리 snapshot + bounded kicad-cli SVG render
+│       ├── src/runtime.rs            # watcher, cache, browser readiness, executable resolve
+│       ├── src/server.rs             # token이 필요한 127.0.0.1 HTTP server
+│       ├── src/lib.rs                # request boundary와 public viewer runtime
+│       ├── src/main.rs               # 엄격한 CLI entrypoint
+│       └── frontend/index.html       # pan/zoom, sheet selector, theme, auto-refresh
 │
 ├── plugin/                           # Python thin launcher (runs inside KiCAD)
 │   ├── __init__.py                   # pcbnew.ActionPlugin — settings dialog (PCB Editor only)
@@ -398,14 +401,18 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
     `protobuf-compiler` and `protobuf-devel`. Missing them fails the build with
     `google/protobuf/any.proto: File not found`.
   - Download: https://github.com/protocolbuffers/protobuf/releases
-- For schematic-viewer (built separately from the workspace — see Quick Start):
-  - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`
-    isn't recognized in the shell)
-  - Tauri 2 prerequisites: WebView2 runtime on Windows (usually pre-installed on Win 10/11)
-  - At runtime it discovers `kicad-cli` from the standard KiCAD install paths, then PATH;
-    override with `--kicad-cli <path>`
-  - Rebuilds fail while a viewer window is open (Windows locks the running `.exe`) — close
-    the app before `cargo build`
+- Schematic-viewer는 main workspace와 분리해 빌드합니다(Quick Start 참조).
+  - Rust toolchain이 PATH에 있어야 합니다. Windows shell에서 찾지 못하면
+    `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`을 먼저 실행합니다.
+  - Tauri, WebView2, GTK, WebKit 개발 package는 필요하지 않습니다. 실행 시
+    시스템 기본 브라우저와 KiCad의 `kicad-cli`를 사용합니다.
+  - `kicad-cli` bare name은 absolute PATH directory에서 exact filename을 찾은 뒤
+    canonical absolute regular executable로 검증합니다. 빈·상대 PATH entry는
+    cwd fallback으로 사용하지 않으며, 기본 `kicad-cli`는 공식 설치 후보도
+    검사합니다. `/absolute/path`와 `./explicit/path`는 PATH fallback 없이 그대로
+    검증합니다.
+  - Windows는 실행 중인 viewer `.exe`를 잠급니다. 다시 빌드하기 전에 browser
+    tab뿐 아니라 viewer process가 종료됐는지 확인합니다.
 
 ## Test Suite
 
@@ -420,16 +427,22 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `konnect-ipc` unit tests | Protobuf builders, client message construction, rigid-body child transform |
 | `crates/konnect/tests/` | Protocol over stdio, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCAD tests |
 
-`schematic-viewer` is **excluded from the workspace** (`Cargo.toml`'s `[workspace] exclude`) since
-it's a Tauri app built separately, so `cargo test --workspace` never touches it. **CI does**: the
-dedicated `viewer` job in `.github/workflows/ci.yml` runs `cargo check` and `cargo test` against
-`crates/schematic-viewer/Cargo.toml`, because without it a viewer break ships silently. Run its
-tests locally with `cd crates/schematic-viewer && cargo test`. Its 20 unit tests cover the pure sheet-tree-walking,
-watch-directory, render-snapshot, event-debounce, and incremental-render-selection logic
-(`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
-`files_needing_render`, `render_all`'s error handling) — the actual `kicad-cli` subprocess call
-and Tauri command/event plumbing stay thin and untested, matching this codebase's existing
-convention for other `kicad-cli`-calling code.
+`schematic-viewer`는 자체 lockfile을 사용하는 독립 executable이므로
+`Cargo.toml`의 `[workspace] exclude`에 있고 `cargo test --workspace`에는 포함되지
+않습니다. CI의 전용 `viewer` job은 `crates/schematic-viewer/Cargo.toml`을 직접
+지정해 check와 test를 수행합니다. 로컬에서는 다음 명령을 사용합니다.
+
+```bash
+cargo test --manifest-path crates/schematic-viewer/Cargo.toml --locked
+cargo clippy --manifest-path crates/schematic-viewer/Cargo.toml --all-targets --locked -- -D warnings
+```
+
+현재 27개 unit test는 hierarchy traversal, symlink·`..`·project 밖 참조 거부,
+secure snapshot, render timeout과 실패 시 stale SVG 제거, 실제 file watcher
+refresh, 병렬 viewer의 port/token 격리, Host·Origin·body·path 제한, browser
+page/state/SVG/`img.onload` readiness, safe PATH resolution을 검사합니다. 설치된
+`kicad-cli`가 표준 위치나 안전한 PATH에 있으면 기본 bare name을 absolute
+executable로 resolve한 뒤 실제 격리 snapshot render도 실행합니다.
 
 ## Adding a New Tool
 

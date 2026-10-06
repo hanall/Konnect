@@ -7,12 +7,35 @@ use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    // 이진 부동소수점 오차를 잘라내면 공식 1.025 mm 패드도 1 nm 축소된다.
+    // KiCad의 정수 내부 단위와 동일하게 가장 가까운 nm로 반올림한다.
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
 pub fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod nanometer_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_library_dimensions_round_to_the_nearest_nanometer() {
+        // KiCad 10 공식 R_0805의 1.025 mm 패드가 1.024999 mm로 축소됐던 실측 회귀.
+        for (millimeters, nanometers) in [
+            (1.025, 1_025_000),
+            (-1.025, -1_025_000),
+            (129.460001 - 0.000001, 129_460_000),
+            (0.0000016, 2),
+            (-0.0000016, -2),
+        ] {
+            assert_eq!(mm_to_nm(millimeters), nanometers);
+            assert_eq!(vec2(millimeters, millimeters).x_nm, nanometers);
+            assert_eq!(distance(millimeters).value_nm, nanometers);
+        }
+    }
 }
 
 /// Build a Vector2 in nanometers from mm coordinates.

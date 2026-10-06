@@ -16,12 +16,13 @@ use crate::tools::{
     get_path, opt_str_list, require_f64, require_str, with_board_ipc_classified, ToolContext,
     ToolDef,
 };
+use anyhow::Context;
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        write_atomic, SexpEdit,
+        write_atomic, write_atomic_if_unchanged, SexpEdit,
     },
 };
 use serde_json::json;
@@ -1133,13 +1134,17 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_layer",
-            "Add a new inner copper or technical layer to the board layer stack.",
+            "Add an inner copper or technical layer to a closed board. Inner copper is enabled \
+             as the smallest contiguous pair that includes the requested layer (for example, \
+             In1.Cu also enables In2.Cu), with canonical IDs/order and a thickness-preserving \
+             stackup. Technical layers use their canonical ID and 'user' type. The exact \
+             candidate must load through kicad-cli before the original is atomically replaced.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":       { "type": "string" },
                     "layer_name":  { "type": "string", "description": "KiCAD layer name (e.g. 'In1.Cu')" },
-                    "layer_type":  { "type": "string", "description": "Type: 'signal', 'power', 'mixed', 'jumper'", "default": "signal" }
+                    "layer_type":  { "type": "string", "description": "Requested inner-copper type: 'signal', 'power', 'mixed', or 'jumper'; technical layers always use KiCad's 'user' type", "default": "signal" }
                 },
                 "required": ["board", "layer_name"]
             }),
@@ -1148,7 +1153,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::ClosedBoardOnly),
         tool!(
             "set_active_layer",
-            "Request an editor active-layer change. The bundled stable KiCad IPC protocol does not expose this editor-session operation, so this tool currently returns unsupported_capability without modifying the board file. It never writes an (active_layer ...) token because KiCad 10 board files do not support one.",
+            "Set the active layer of the exact PCB open in KiCad through native IPC, then read it \
+             back before reporting success. This changes editor-session state only and never \
+             writes an active-layer token to the board file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1158,7 +1165,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_active_layer(args, ctx).await }
-        ),
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "add_board_outline",
             "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
@@ -1922,9 +1930,310 @@ async fn handle_get_layer_list(
     ))
 }
 
+fn inner_copper_number(name: &str) -> Option<usize> {
+    name.strip_prefix("In")
+        .and_then(|name| name.strip_suffix(".Cu"))
+        .and_then(|number| number.parse::<usize>().ok())
+        .filter(|number| (1..=30).contains(number))
+}
+
+fn canonical_non_copper_id(name: &str, legacy_ids: bool) -> Option<i32> {
+    if let Some(number) = name
+        .strip_prefix("User.")
+        .and_then(|number| number.parse::<i32>().ok())
+        .filter(|number| (1..=45).contains(number))
+    {
+        return Some(if legacy_ids {
+            if number <= 9 {
+                49 + number
+            } else {
+                50 + number
+            }
+        } else {
+            37 + 2 * number
+        });
+    }
+    let id = if legacy_ids {
+        match name {
+            "B.Adhes" => 32,
+            "F.Adhes" => 33,
+            "B.Paste" => 34,
+            "F.Paste" => 35,
+            "B.SilkS" => 36,
+            "F.SilkS" => 37,
+            "B.Mask" => 38,
+            "F.Mask" => 39,
+            "Dwgs.User" => 40,
+            "Cmts.User" => 41,
+            "Eco1.User" => 42,
+            "Eco2.User" => 43,
+            "Edge.Cuts" => 44,
+            "Margin" => 45,
+            "B.CrtYd" => 46,
+            "F.CrtYd" => 47,
+            "B.Fab" => 48,
+            "F.Fab" => 49,
+            _ => return None,
+        }
+    } else {
+        match name {
+            "B.Mask" => 3,
+            "F.SilkS" => 5,
+            "B.SilkS" => 7,
+            "F.Adhes" => 9,
+            "B.Adhes" => 11,
+            "F.Paste" => 13,
+            "B.Paste" => 15,
+            "Dwgs.User" => 17,
+            "Cmts.User" => 19,
+            "Eco1.User" => 21,
+            "Eco2.User" => 23,
+            "Edge.Cuts" => 25,
+            "Margin" => 27,
+            "B.CrtYd" => 29,
+            "F.CrtYd" => 31,
+            "B.Fab" => 33,
+            "F.Fab" => 35,
+            _ => return None,
+        }
+    };
+    Some(id)
+}
+
+fn stackup_layer_name(block: &str) -> Option<String> {
+    let node = parse_sexp(block).ok()?;
+    (node.get(0)?.as_str()? == "layer").then(|| node.get(1)?.as_str().map(str::to_string))?
+}
+
+fn stackup_layer_thickness(block: &str) -> Option<f64> {
+    parse_sexp(block).ok()?.find("thickness")?.get_f64(1)
+}
+
+fn stackup_property(block: &str, name: &str) -> Option<String> {
+    parse_sexp(block)
+        .ok()?
+        .find(name)?
+        .get(1)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn expand_copper_stackup(
+    content: String,
+    target_inner_count: usize,
+    added_inner_count: usize,
+) -> anyhow::Result<String> {
+    let Some(stackup_start) = content.find("(stackup") else {
+        // KiCad derives a default stackup from the enabled layer table when a
+        // board has no explicit stackup. The candidate CLI validation below is
+        // still authoritative for that derived form.
+        return Ok(content);
+    };
+    let stackup_end =
+        close_of_block(&content, stackup_start).context("unbalanced stackup block")? + 1;
+    let stackup = &content[stackup_start..stackup_end];
+    let entries = find_direct_child_blocks(stackup, "stackup");
+    let mut f_cu = None;
+    let mut b_cu = None;
+    let mut dielectric_blocks = Vec::new();
+    let mut existing_inner_thickness = Vec::new();
+    for (start, end) in entries {
+        let block = &stackup[start..end];
+        let Some(name) = stackup_layer_name(block) else {
+            continue;
+        };
+        match name.as_str() {
+            "F.Cu" => f_cu = Some((start, end, block.to_string())),
+            "B.Cu" => b_cu = Some((start, end, block.to_string())),
+            name if name.starts_with("dielectric ") => {
+                if block.matches("(thickness").count() != 1 {
+                    anyhow::bail!("stackup dielectric sublayers are not supported by add_layer");
+                }
+                dielectric_blocks.push(block.to_string());
+            }
+            name if inner_copper_number(name).is_some() => {
+                existing_inner_thickness.push(
+                    stackup_layer_thickness(block)
+                        .context("inner copper stackup entry has no thickness")?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let (f_start, f_end, f_block) = f_cu.context("stackup has no F.Cu entry")?;
+    let (b_start, _b_end, b_block) = b_cu.context("stackup has no B.Cu entry")?;
+    if f_start >= b_start || dielectric_blocks.is_empty() {
+        anyhow::bail!("stackup copper/dielectric order is not supported by add_layer");
+    }
+    let f_thickness = stackup_layer_thickness(&f_block).context("F.Cu has no thickness")?;
+    let b_thickness = stackup_layer_thickness(&b_block).context("B.Cu has no thickness")?;
+    let new_copper_thickness = (f_thickness + b_thickness) / 2.0;
+    let dielectric_total = dielectric_blocks
+        .iter()
+        .map(|block| stackup_layer_thickness(block).context("dielectric has no thickness"))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<f64>();
+    let remaining_dielectric = dielectric_total - added_inner_count as f64 * new_copper_thickness;
+    if !remaining_dielectric.is_finite() || remaining_dielectric <= 0.0 {
+        anyhow::bail!("stackup has no thickness budget for the requested copper pair");
+    }
+    let dielectric_thickness = remaining_dielectric / (target_inner_count + 1) as f64;
+    let template = &dielectric_blocks[0];
+    let material = stackup_property(template, "material")
+        .map(|value| format!("\n\t\t\t\t(material \"{value}\")"))
+        .unwrap_or_default();
+    let epsilon_r = stackup_property(template, "epsilon_r")
+        .map(|value| format!("\n\t\t\t\t(epsilon_r {value})"))
+        .unwrap_or_default();
+    let loss_tangent = stackup_property(template, "loss_tangent")
+        .map(|value| format!("\n\t\t\t\t(loss_tangent {value})"))
+        .unwrap_or_default();
+    let mut middle = String::new();
+    for slot in 1..=target_inner_count + 1 {
+        let dielectric_type = if slot % 2 == 1 { "prepreg" } else { "core" };
+        middle.push_str(&format!(
+            "\n\t\t\t(layer \"dielectric {slot}\"\n\t\t\t\t(type \"{dielectric_type}\")\n\t\t\t\t(thickness {dielectric_thickness:.9}){material}{epsilon_r}{loss_tangent}\n\t\t\t)"
+        ));
+        if slot <= target_inner_count {
+            let name = format!("In{slot}.Cu");
+            let thickness = existing_inner_thickness
+                .get(slot - 1)
+                .copied()
+                .unwrap_or(new_copper_thickness);
+            middle.push_str(&format!(
+                "\n\t\t\t(layer \"{name}\"\n\t\t\t\t(type \"copper\")\n\t\t\t\t(thickness {thickness:.9})\n\t\t\t)"
+            ));
+        }
+    }
+    middle.push_str("\n\t\t\t");
+    let absolute_start = stackup_start + f_end;
+    let absolute_end = stackup_start + b_start;
+    Ok(apply_edits(
+        content,
+        vec![SexpEdit::replace(absolute_start, absolute_end, middle)],
+    ))
+}
+
+fn copper_layer_candidate(
+    content: &str,
+    requested_layer: &str,
+    requested_type: &str,
+) -> anyhow::Result<(String, Vec<String>, usize, i32)> {
+    if !matches!(requested_type, "signal" | "power" | "mixed" | "jumper") {
+        anyhow::bail!("copper layer_type must be signal, power, mixed, or jumper");
+    }
+    let requested_number = inner_copper_number(requested_layer)
+        .context("only In1.Cu..In30.Cu are addable copper layers")?;
+    let tree = parse_sexp(content)?;
+    let layers = konnect_sexp::layers::layers(&tree);
+    let existing_inner_count = layers
+        .iter()
+        .filter_map(|layer| inner_copper_number(&layer.name))
+        .max()
+        .unwrap_or(0);
+    for number in 1..=existing_inner_count {
+        if !layers
+            .iter()
+            .any(|layer| layer.name == format!("In{number}.Cu"))
+        {
+            anyhow::bail!("existing inner copper layers are not contiguous");
+        }
+    }
+    if existing_inner_count % 2 != 0 {
+        anyhow::bail!("existing board has an invalid odd inner-copper count");
+    }
+    if requested_number <= existing_inner_count {
+        let id = layers
+            .iter()
+            .find(|layer| layer.name == requested_layer)
+            .map(|layer| layer.id)
+            .context("requested existing layer has no id")?;
+        return Ok((
+            content.to_string(),
+            Vec::new(),
+            existing_inner_count + 2,
+            id,
+        ));
+    }
+    let mut target_inner_count = requested_number;
+    if target_inner_count % 2 != 0 {
+        target_inner_count += 1;
+    }
+    let b_cu = layers
+        .iter()
+        .find(|layer| layer.name == "B.Cu")
+        .context("board has no B.Cu layer")?;
+    let legacy_ids = b_cu.id == 31;
+    if !legacy_ids && b_cu.id != 2 {
+        anyhow::bail!("unsupported board layer-id encoding");
+    }
+    let layers_pos = content
+        .find("(layers")
+        .context("No (layers) section found")?;
+    let close = close_of_block(content, layers_pos).context("Unbalanced (layers) block")?;
+    let table = &content[layers_pos..close];
+    let b_marker = format!("({} \"B.Cu\"", b_cu.id);
+    let b_offset = table
+        .find(&b_marker)
+        .context("B.Cu entry not found in layer table")?;
+    let indent = entry_indent(content, layers_pos).unwrap_or_else(|| "\t\t".to_string());
+    let mut insertion = String::new();
+    let mut added = Vec::new();
+    let mut requested_id = 0;
+    for number in existing_inner_count + 1..=target_inner_count {
+        let name = format!("In{number}.Cu");
+        let id = if legacy_ids {
+            number as i32
+        } else {
+            (number as i32 + 1) * 2
+        };
+        let kind = if name == requested_layer {
+            requested_type
+        } else {
+            "signal"
+        };
+        if name == requested_layer {
+            requested_id = id;
+        }
+        insertion.push_str(&format!("({id} \"{name}\" {kind})\n{indent}"));
+        added.push(name);
+    }
+    let with_layers = apply_edits(
+        content.to_string(),
+        vec![SexpEdit::insert(layers_pos + b_offset, insertion)],
+    );
+    let candidate = expand_copper_stackup(
+        with_layers,
+        target_inner_count,
+        target_inner_count - existing_inner_count,
+    )?;
+    Ok((candidate, added, target_inner_count + 2, requested_id))
+}
+
+async fn validate_layer_candidate(
+    cli_path: &str,
+    board_path: &Path,
+    candidate: &str,
+) -> anyhow::Result<()> {
+    let parent = board_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::Builder::new()
+        .prefix(".konnect-add-layer-")
+        .suffix(".kicad_pcb")
+        .tempfile_in(parent)?;
+    use std::io::Write;
+    staged.write_all(candidate.as_bytes())?;
+    staged.flush()?;
+    staged.as_file().sync_all()?;
+    super::cli::run_drc(cli_path, staged.path(), false)
+        .await
+        .context("kicad-cli rejected add_layer candidate")?;
+    Ok(())
+}
+
 async fn handle_add_layer(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let layer_name = match require_str(args, "layer_name") {
@@ -1950,28 +2259,118 @@ async fn handle_add_layer(
 
     let content = std::fs::read_to_string(&board_path)?;
 
-    // Find the (layers ...) block and insert before its closing paren
+    if inner_copper_number(&layer_name).is_some() {
+        let (candidate, added_layers, final_copper_layer_count, requested_id) =
+            match copper_layer_candidate(&content, &layer_name, layer_type) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    return Ok(CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: "layer_name".to_string(),
+                            reason: format!("{error:#}"),
+                        },
+                        format!("Cannot add copper layer '{layer_name}': {error:#}"),
+                    ))
+                }
+            };
+        if added_layers.is_empty() {
+            return Ok(CallToolResult::json(&json!({
+                "requested_layer": layer_name,
+                "requested_layer_id": requested_id,
+                "added_layers": [],
+                "auto_added_companions": [],
+                "final_copper_layer_count": final_copper_layer_count,
+                "already_present": true,
+                "source": "saved_file_readback"
+            })));
+        }
+        if let Err(error) =
+            validate_layer_candidate(&ctx.config.kicad_cli, &board_path, &candidate).await
+        {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: format!("{error:#}"),
+                },
+                format!(
+                    "add_layer candidate was refused before writing '{}': {error:#}. The original board was preserved.",
+                    board_path.display()
+                ),
+            ));
+        }
+        write_atomic_if_unchanged(&board_path, &content, &candidate)?;
+        let auto_added_companions = added_layers
+            .iter()
+            .filter(|name| *name != &layer_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Ok(CallToolResult::json(&json!({
+            "requested_layer": layer_name,
+            "requested_layer_id": requested_id,
+            "requested_type": layer_type,
+            "added_layers": added_layers,
+            "auto_added_companions": auto_added_companions,
+            "final_copper_layer_count": final_copper_layer_count,
+            "already_present": false,
+            "candidate_validation": "kicad-cli pcb drc parsed the exact candidate",
+            "source": "kicad_cli_validated_saved_file"
+        })));
+    }
+
+    // Non-copper layers retain their canonical file ID. Picking the first
+    // unused integer is invalid: in KiCad 9/10's current encoding even IDs are
+    // copper while the fixed technical and user layers occupy named odd IDs.
+    let tree = parse_sexp(&content)?;
+    let layers = konnect_sexp::layers::layers(&tree);
+    if let Some(existing) = layers.iter().find(|layer| layer.name == layer_name) {
+        return Ok(CallToolResult::json(&json!({
+            "requested_layer": layer_name,
+            "requested_layer_id": existing.id,
+            "added_layers": [],
+            "already_present": true,
+            "final_copper_layer_count": konnect_sexp::layers::copper(&layers).len(),
+            "source": "saved_file_readback"
+        })));
+    }
+    let b_cu = layers
+        .iter()
+        .find(|layer| layer.name == "B.Cu")
+        .map(|layer| layer.id);
+    let legacy_ids = b_cu == Some(31);
+    if !legacy_ids && b_cu != Some(2) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "board".to_string(),
+                reason: "unsupported board layer-id encoding".to_string(),
+            },
+            "Cannot add layer: unsupported board layer-id encoding",
+        ));
+    }
+    let Some(new_id) = canonical_non_copper_id(&layer_name, legacy_ids) else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "layer_name".to_string(),
+                reason: "this canonical layer cannot be enabled by add_layer".to_string(),
+            },
+            format!("Cannot add layer '{layer_name}' with this board encoding"),
+        ));
+    };
+    if let Some(existing) = layers.iter().find(|layer| layer.id == new_id) {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "layer_name".to_string(),
+                reason: format!("canonical id {new_id} is already used by {}", existing.name),
+            },
+            format!(
+                "Cannot add layer '{layer_name}': id {new_id} belongs to '{}'.",
+                existing.name
+            ),
+        ));
+    }
+
+    // Find the (layers ...) block and insert before its closing paren.
     let layers_pos = match content.find("(layers") {
         Some(p) => p,
         None => return Ok(CallToolResult::error("No (layers) section found")),
-    };
-
-    // Determine the next available inner copper ID (first unused ID in 1-30 range).
-    // The ids have to be read by shape — see konnect_sexp::layers. Reading them
-    // with find_all("") returned nothing, so every call allocated id 1 and
-    // duplicated In1.Cu on any board that already had an inner layer.
-    let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = konnect_sexp::layers::layers(&tree)
-        .iter()
-        .map(|l| l.id)
-        .collect();
-    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
-        Some(id) => id,
-        None => {
-            return Ok(CallToolResult::error(
-                "No free inner copper layer id: 1-30 are all in use",
-            ))
-        }
     };
 
     // Close of the layers block, by paren balance. The previous probe looked for
@@ -1994,35 +2393,141 @@ async fn handle_add_layer(
     // Match whatever the file already indents entries with, rather than
     // hardcoding spaces into a file that may be tab-indented.
     let indent = entry_indent(&content, layers_pos).unwrap_or_else(|| "    ".to_string());
-    let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" user)");
+    let candidate = apply_edits(
+        content.clone(),
+        vec![SexpEdit::insert(insert_pos, new_layer)],
+    );
+    if let Err(error) =
+        validate_layer_candidate(&ctx.config.kicad_cli, &board_path, &candidate).await
+    {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: format!("{error:#}"),
+            },
+            format!(
+                "add_layer candidate was refused before writing '{}': {error:#}. The original board was preserved.",
+                board_path.display()
+            ),
+        ));
+    }
+    write_atomic_if_unchanged(&board_path, &content, &candidate)?;
 
     Ok(CallToolResult::json(&json!({
-        "added_layer": layer_name, "id": new_id, "type": layer_type
+        "requested_layer": layer_name,
+        "requested_layer_id": new_id,
+        "requested_type": layer_type,
+        "applied_type": "user",
+        "added_layers": [layer_name],
+        "already_present": false,
+        "final_copper_layer_count": konnect_sexp::layers::copper(&layers).len(),
+        "candidate_validation": "kicad-cli pcb drc parsed the exact candidate",
+        "source": "kicad_cli_validated_saved_file"
     })))
 }
 
 async fn handle_set_active_layer(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let layer = match require_str(args, "layer") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let requested = match builders::try_layer_from_name(&layer) {
+        Ok(layer) => layer,
+        Err(error) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "layer".to_string(),
+                    reason: error.to_string(),
+                },
+                format!("Argument 'layer' is invalid: {error}"),
+            ))
+        }
+    };
 
-    Ok(CallToolResult::error_kind(
-        crate::mcp::error::ToolErrorKind::UnsupportedCapability {
-            capability: "set_active_layer".to_string(),
-            kicad_version: None,
-        },
-        format!(
-            "Cannot set active layer '{layer}' for '{}': active layer is editor-session state, and the bundled stable KiCad IPC protocol does not expose a supported mutation or readback. The board file was not changed.",
-            board_path.display()
-        ),
-    ))
+    let result = with_board_ipc_classified(ctx, &board_path, move |client, document| {
+        let previous = client.get_active_layer_in(document.clone())?;
+        client.set_active_layer_in(document.clone(), requested)?;
+        let observed = client.get_active_layer_in(document).map_err(|error| {
+            error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                command: "SetActiveLayer readback".to_string(),
+                reason: format!(
+                    "the set completed for {}, but readback failed; previous layer was {}",
+                    requested.as_str_name(),
+                    previous.as_str_name()
+                ),
+            })
+        })?;
+        if observed != requested {
+            return Err(anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
+                command: "SetActiveLayer readback".to_string(),
+                reason: format!(
+                    "requested {}, previous {}, observed {}",
+                    requested.as_str_name(),
+                    previous.as_str_name(),
+                    observed.as_str_name()
+                ),
+            }));
+        }
+        Ok((previous, observed))
+    })
+    .await?;
+    let (previous, observed) = match result {
+        Ok(result) => result,
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error))
+        }
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message))
+        }
+        Err(konnect_ipc::IpcFailure::Recovered(message)) => {
+            return Ok(crate::tools::ipc_recovered_result(&message))
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(message)) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::EditorUnavailable {
+                    editor: "pcb".to_string(),
+                    reason: message.clone(),
+                },
+                format!(
+                    "Cannot set active layer '{}' for '{}': {}",
+                    layer,
+                    board_path.display(),
+                    message
+                ),
+            ))
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                format!(
+                    "KiCad refused active layer '{}' for '{}': {}",
+                    layer,
+                    board_path.display(),
+                    message
+                ),
+            ))
+        }
+    };
+    let file_name = |layer: konnect_ipc::gen::kiapi::board::types::BoardLayer| {
+        layer
+            .as_str_name()
+            .trim_start_matches("BL_")
+            .replace('_', ".")
+    };
+    Ok(CallToolResult::json(&json!({
+        "board": board_path,
+        "previous_layer": file_name(previous),
+        "active_layer": file_name(observed),
+        "readback": "exact_match",
+        "board_file_modified": false,
+        "source": "ipc"
+    })))
 }
 
 #[cfg(test)]
@@ -2056,14 +2561,14 @@ mod active_layer_refusal_tests {
     }
 
     #[tokio::test]
-    async fn set_active_layer_is_typed_unsupported_and_writes_nothing() {
+    async fn set_active_layer_rejects_an_unknown_layer_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("safe.kicad_pcb");
         let original = b"(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n)\n";
         std::fs::write(&board, original).unwrap();
 
         let result = handle_set_active_layer(
-            &json!({"board": board.to_str().unwrap(), "layer": "B.Cu"}),
+            &json!({"board": board.to_str().unwrap(), "layer": "invented.layer"}),
             &test_ctx(),
         )
         .await
@@ -2071,23 +2576,421 @@ mod active_layer_refusal_tests {
 
         assert!(result.is_error);
         let body = body(&result);
-        assert_eq!(body["error"]["kind"], "unsupported_capability");
-        assert_eq!(body["error"]["capability"], "set_active_layer");
-        assert!(body["message"].as_str().unwrap().contains("not changed"));
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "layer");
         assert_eq!(std::fs::read(&board).unwrap(), original);
     }
 
     #[test]
-    fn set_active_layer_catalogue_discloses_refusal_and_no_file_write_contract() {
+    fn set_active_layer_catalogue_discloses_native_readback_and_no_file_write() {
         let tool = tools()
             .into_iter()
             .find(|tool| tool.name == "set_active_layer")
             .expect("registered tool");
 
-        assert_eq!(tool.board_access, BoardAccess::None);
-        assert!(tool.description.contains("unsupported_capability"));
-        assert!(tool.description.contains("never writes"));
-        assert!(!tool.description.contains("recorded in the board file"));
+        assert_eq!(tool.board_access, BoardAccess::LiveOnly);
+        assert!(tool.description.contains("native IPC"));
+        assert!(tool.description.contains("read it back"));
+        assert!(tool.description.contains("never"));
+    }
+}
+
+#[cfg(test)]
+mod active_layer_native_tests {
+    use super::board_mock::{board_document, ctx_talking_to, spawn_kicad_holding_board};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    type ActiveLayerRequests = Arc<
+        Mutex<
+            Vec<(
+                &'static str,
+                Option<kiapi::common::types::DocumentSpecifier>,
+            )>,
+        >,
+    >;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        serde_json::from_str(text).expect("structured tool result")
+    }
+
+    fn assert_exact_active_layer_requests(requests: &ActiveLayerRequests, board: &Path) {
+        let resolved = board_document(&board.to_string_lossy());
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                ("GetActiveLayer", Some(resolved.clone())),
+                ("SetActiveLayer", Some(resolved.clone())),
+                ("GetActiveLayer", Some(resolved)),
+            ],
+            "the pre-read, mutation, and readback must all address the exact document returned by GetOpenDocuments"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_uses_native_ipc_and_reads_the_result_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("active.kicad_pcb");
+        let original = "(kicad_pcb\n\t(version 20260206)\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t)\n)\n";
+        std::fs::write(&board, original).unwrap();
+        let active = Arc::new(Mutex::new(kiapi::board::types::BoardLayer::BlFCu as i32));
+        let active_for_server = Arc::clone(&active);
+        let requests = ActiveLayerRequests::default();
+        let requests_for_server = Arc::clone(&requests);
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetActiveLayer") {
+                let request =
+                    kiapi::board::commands::GetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("GetActiveLayer", request.board));
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardLayerResponse {
+                        layer: *active_for_server.lock().unwrap(),
+                    },
+                    "kiapi.board.commands.BoardLayerResponse",
+                ))
+            } else if command.type_url.ends_with("SetActiveLayer") {
+                let request =
+                    kiapi::board::commands::SetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("SetActiveLayer", request.board.clone()));
+                *active_for_server.lock().unwrap() = request.layer;
+                Some(prost_types::Any {
+                    type_url: "type.googleapis.com/google.protobuf.Empty".to_string(),
+                    value: Vec::new(),
+                })
+            } else {
+                None
+            }
+        });
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_set_active_layer(&json!({"board": board, "layer": "B.Cu"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let text = match result.content.first().unwrap() {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["previous_layer"], "F.Cu");
+        assert_eq!(body["active_layer"], "B.Cu");
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(
+            *active.lock().unwrap(),
+            kiapi::board::types::BoardLayer::BlBCu as i32
+        );
+        assert_exact_active_layer_requests(&requests, &board);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_readback_mismatch_is_uncertain_and_exactly_targeted() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("active-mismatch.kicad_pcb");
+        let original = "(kicad_pcb\n\t(version 20260206)\n)\n";
+        std::fs::write(&board, original).unwrap();
+        let requests = ActiveLayerRequests::default();
+        let requests_for_server = Arc::clone(&requests);
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetActiveLayer") {
+                let request =
+                    kiapi::board::commands::GetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("GetActiveLayer", request.board));
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardLayerResponse {
+                        layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                    },
+                    "kiapi.board.commands.BoardLayerResponse",
+                ))
+            } else if command.type_url.ends_with("SetActiveLayer") {
+                let request =
+                    kiapi::board::commands::SetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("SetActiveLayer", request.board));
+                Some(prost_types::Any {
+                    type_url: "type.googleapis.com/google.protobuf.Empty".to_string(),
+                    value: Vec::new(),
+                })
+            } else {
+                None
+            }
+        });
+
+        let result = handle_set_active_layer(
+            &json!({"board": board, "layer": "B.Cu"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "a mismatching readback cannot be success");
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown");
+        assert_eq!(body["error"]["board_state"], "unknown");
+        assert_eq!(body["error"]["retry_safe"], false);
+        assert_exact_active_layer_requests(&requests, &board);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn set_active_layer_readback_failure_is_uncertain_and_exactly_targeted() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("active-readback-failure.kicad_pcb");
+        let original = "(kicad_pcb\n\t(version 20260206)\n)\n";
+        std::fs::write(&board, original).unwrap();
+        let requests = ActiveLayerRequests::default();
+        let requests_for_server = Arc::clone(&requests);
+        let get_count = Arc::new(AtomicUsize::new(0));
+        let get_count_for_server = Arc::clone(&get_count);
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetActiveLayer") {
+                let request =
+                    kiapi::board::commands::GetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("GetActiveLayer", request.board));
+                (get_count_for_server.fetch_add(1, Ordering::Relaxed) == 0).then(|| {
+                    konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardLayerResponse {
+                            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                        },
+                        "kiapi.board.commands.BoardLayerResponse",
+                    )
+                })
+            } else if command.type_url.ends_with("SetActiveLayer") {
+                let request =
+                    kiapi::board::commands::SetActiveLayer::decode(command.value.as_slice())
+                        .unwrap();
+                requests_for_server
+                    .lock()
+                    .unwrap()
+                    .push(("SetActiveLayer", request.board));
+                Some(prost_types::Any {
+                    type_url: "type.googleapis.com/google.protobuf.Empty".to_string(),
+                    value: Vec::new(),
+                })
+            } else {
+                None
+            }
+        });
+
+        let result = handle_set_active_layer(
+            &json!({"board": board, "layer": "B.Cu"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_error,
+            "missing post-set readback cannot be success"
+        );
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown");
+        assert_eq!(body["error"]["board_state"], "unknown");
+        assert_eq!(body["error"]["retry_safe"], false);
+        assert_exact_active_layer_requests(&requests, &board);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod add_layer_integrity_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    const TWO_LAYER_BOARD: &str =
+        include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");
+
+    fn context(cli: &Path) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn validating_cli(dir: &Path, accept: bool) -> PathBuf {
+        let body = if accept {
+            r#"#!/bin/sh
+out=''
+previous=''
+board=''
+for argument in "$@"; do
+  if [ "$previous" = '--output' ]; then out="$argument"; fi
+  previous="$argument"
+  board="$argument"
+done
+if grep -q '(4 "In1.Cu"' "$board" && grep -q '(6 "In2.Cu"' "$board"; then
+  printf '{"violations":[],"unconnected_items":[],"schematic_parity":[]}' > "$out"
+  exit 0
+fi
+exit 3
+"#
+        } else {
+            "#!/bin/sh\nexit 3\n"
+        };
+        crate::tools::cli::test_support::write_script(
+            dir,
+            if accept {
+                "validating-kicad-cli"
+            } else {
+                "rejecting-kicad-cli"
+            },
+            body,
+            "@exit /b 3\r\n",
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        serde_json::from_str(text).expect("structured tool result")
+    }
+
+    #[tokio::test]
+    async fn adding_in1_builds_the_minimum_valid_copper_pair_and_stackup() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("four-layer.kicad_pcb");
+        std::fs::write(&board, TWO_LAYER_BOARD).unwrap();
+        let cli = validating_cli(dir.path(), true);
+
+        let result = handle_add_layer(
+            &json!({"board": board, "layer_name": "In1.Cu", "layer_type": "power"}),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&board).unwrap();
+        let in1 = after
+            .find("(4 \"In1.Cu\" power)")
+            .expect("requested inner layer");
+        let in2 = after
+            .find("(6 \"In2.Cu\" signal)")
+            .expect("paired inner layer");
+        let bottom = after.find("(2 \"B.Cu\" signal)").expect("bottom copper");
+        assert!(
+            in1 < in2 && in2 < bottom,
+            "copper layers must remain in physical order"
+        );
+        assert!(after.contains("(layer \"In1.Cu\""));
+        assert!(after.contains("(layer \"In2.Cu\""));
+        assert!(after.contains("(layer \"dielectric 3\""));
+        let stackup_start = after.find("(stackup").unwrap();
+        let stackup_end = close_of_block(&after, stackup_start).unwrap() + 1;
+        let stackup = &after[stackup_start..stackup_end];
+        let physical_thickness = find_direct_child_blocks(stackup, "stackup")
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let block = &stackup[start..end];
+                let name = stackup_layer_name(block)?;
+                (name.ends_with(".Cu")
+                    || name.ends_with(".Mask")
+                    || name.starts_with("dielectric "))
+                .then(|| stackup_layer_thickness(block))?
+            })
+            .sum::<f64>();
+        assert!(
+            (physical_thickness - 1.6).abs() < 1e-9,
+            "stackup thickness changed to {physical_thickness} mm"
+        );
+        let body = body(&result);
+        assert_eq!(body["requested_layer"], "In1.Cu");
+        assert_eq!(body["added_layers"], json!(["In1.Cu", "In2.Cu"]));
+        assert_eq!(body["final_copper_layer_count"], 4);
+        assert_eq!(body["source"], "kicad_cli_validated_saved_file");
+    }
+
+    #[tokio::test]
+    async fn candidate_cli_rejection_preserves_the_original_board_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("preserved.kicad_pcb");
+        std::fs::write(&board, TWO_LAYER_BOARD).unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let cli = validating_cli(dir.path(), false);
+
+        let result = handle_add_layer(
+            &json!({"board": board, "layer_name": "In1.Cu"}),
+            &context(&cli),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "handler_error");
+        assert!(body["message"].as_str().unwrap().contains("candidate"));
+    }
+
+    /// Actual KiCad acceptance for the complete write path:
+    ///
+    ///     KICAD_CLI=/usr/local/bin/kicad-cli \
+    ///       cargo test -p konnect-core --locked --lib \
+    ///       add_layer_live_kicad_roundtrip -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a real KiCad 10 kicad-cli"]
+    async fn add_layer_live_kicad_roundtrip_runs_drc_and_ipcd356_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("four-layer.kicad_pcb");
+        std::fs::write(&board, TWO_LAYER_BOARD).unwrap();
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+
+        let result = handle_add_layer(
+            &json!({"board": board, "layer_name": "In1.Cu", "layer_type": "power"}),
+            &context(Path::new(&cli)),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        crate::tools::cli::run_drc(&cli, &board, false)
+            .await
+            .expect("KiCad must load the written four-layer board for DRC");
+        let netlist = dir.path().join("four-layer.d356");
+        crate::tools::cli::export_ipcd356(&cli, &board, &netlist)
+            .await
+            .expect("KiCad must load the written four-layer board for export");
+        assert!(netlist.is_file() && netlist.metadata().unwrap().len() > 0);
     }
 }
 
@@ -2416,15 +3319,19 @@ async fn handle_add_mounting_hole(
     let lib_id_ipc = spec.lib_id.clone();
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
+    let value_ipc = prepared.value.clone();
+    let library_source_ipc = library_source.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
-        c.place_footprint(
+        if let Some(source) = &library_source_ipc {
+            super::pcb_components::validate_typed_ipc_footprint_source(source)?;
+        }
+        super::pcb_components::place_prepared_footprint(
+            c,
             &requested_board,
+            &prepared_ipc,
             &lib_id_ipc,
             &reference_ipc,
-            &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
+            &value_ipc,
             x,
             y,
             0.0,
@@ -4534,6 +5441,112 @@ mod mounting_hole_tests {
         );
         assert!(updated.contains("(drill 3.2)"), "{updated}");
         assert!(updated.contains("\"H1\""), "{updated}");
+    }
+}
+
+#[cfg(test)]
+mod mounting_hole_lossless_bridge_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::mounting_hole_tests::{blank_board, result_text};
+    use super::*;
+    use std::path::PathBuf;
+
+    fn installed_mounting_hole() -> Option<(PathBuf, String)> {
+        let mut roots = vec![PathBuf::from("/opt/kicad/10.0.6/share/kicad")];
+        roots.extend(crate::kicad_install::share_roots());
+        roots
+            .into_iter()
+            .map(|root| {
+                root.join("footprints")
+                    .join("MountingHole.pretty")
+                    .join("MountingHole_3.2mm_M3.kicad_mod")
+            })
+            .find_map(|path| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|source| (path, source))
+            })
+    }
+
+    #[test]
+    fn stock_mounting_hole_is_supported_by_the_complete_typed_preparation() {
+        let Some((path, source)) = installed_mounting_hole() else {
+            eprintln!("no installed KiCad MountingHole library; skipping");
+            return;
+        };
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"MountingHole\")(type \"KiCad\")(uri \"{}\")(options \"\")(descr \"\"))\n)\n",
+                path.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        super::super::pcb_components::validate_typed_ipc_footprint_source(&source)
+            .expect("stock mounting hole must fit the complete typed IPC representation");
+        super::super::pcb_components::PreparedFootprintPlacement::from_library(
+            &source,
+            "MountingHole:MountingHole_3.2mm_M3",
+            "H1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(project.path()),
+        )
+        .expect("stock mounting hole must prepare without lossy fallback");
+    }
+
+    #[tokio::test]
+    async fn project_shadowed_point_refuses_live_typed_placement_without_board_file_write() {
+        let Some((_path, stock)) = installed_mounting_hole() else {
+            eprintln!("no installed KiCad MountingHole library; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let pretty = dir.path().join("shadow.pretty");
+        std::fs::create_dir(&pretty).unwrap();
+        let mut shadow = stock;
+        let close = shadow.rfind(')').unwrap();
+        shadow.insert_str(
+            close,
+            "\n\t(point\n\t\t(at 0 0)\n\t\t(size 1.27)\n\t\t(layer \"F.Fab\")\n\t\t(uuid \"11111111-1111-4111-8111-111111111111\")\n\t)\n",
+        );
+        std::fs::write(pretty.join("MountingHole_3.2mm_M3.kicad_mod"), shadow).unwrap();
+        std::fs::write(
+            dir.path().join("fp-lib-table"),
+            "(fp_lib_table\n  (version 7)\n  (lib (name \"MountingHole\")(type \"KiCad\")(uri \"${KIPRJMOD}/shadow.pretty\")(options \"\")(descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let ctx = ctx_talking_to(server.address().to_string());
+
+        let result = handle_add_mounting_hole(
+            &json!({
+                "board": board,
+                "x": 10.0,
+                "y": 20.0,
+                "drill_diameter": 3.2,
+                "reference": "H1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let text = result_text(&result);
+        assert!(
+            text.contains(
+                "footprint child 'point' has no lossless KiCad 10 typed IPC representation"
+            ),
+            "refusal must expose the typed-IPC preflight reason: {text}"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before);
     }
 }
 

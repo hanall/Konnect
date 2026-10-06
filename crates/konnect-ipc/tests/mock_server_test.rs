@@ -1636,6 +1636,9 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
     .unwrap();
 
     let mut fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+    fp.id = Some(kiapi::common::types::Kiid {
+        value: "graphic-parent-kiid".to_string(),
+    });
     for child in &mut fp.definition.as_mut().unwrap().items {
         let id = Some(kiapi::common::types::Kiid {
             value: if builders::any_is(child, "kiapi.board.types.Pad") {
@@ -1676,6 +1679,18 @@ fn a_pads_uuid_is_never_accepted_as_a_graphic_to_edit() {
         let message = request.message.expect("request must pack a command");
         if message.type_url.ends_with("GetOpenDocuments") {
             return Some(open_board_response());
+        }
+        if message.type_url.ends_with("SaveDocumentToString") {
+            let command =
+                kiapi::common::commands::SaveDocumentToString::decode(message.value.as_slice())
+                    .unwrap();
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::SavedDocumentResponse {
+                    document: command.document,
+                    contents: "(kicad_pcb (footprint Mock (uuid graphic-parent-kiid)))".to_string(),
+                },
+                "kiapi.common.commands.SavedDocumentResponse",
+            )));
         }
         if message.type_url.ends_with("GetItems") {
             let response = kiapi::common::commands::GetItemsResponse {

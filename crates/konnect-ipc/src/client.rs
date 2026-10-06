@@ -502,6 +502,112 @@ fn unpack_required<M: Message + Default>(
     unpack_any(&response)
 }
 
+/// 전체 footprint를 교체할 때 기존 객체를 정확한 KIID로 결속한다.
+fn whole_footprint_targets(items: &[prost_types::Any]) -> Result<BTreeSet<String>> {
+    let mut targets = BTreeSet::new();
+    for item in items {
+        if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+            continue;
+        }
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = footprint
+            .id
+            .context("footprint 교체 대상 KIID가 없습니다")?
+            .value;
+        if id.is_empty() || !targets.insert(id.clone()) {
+            anyhow::bail!("footprint 교체 대상 KIID가 비어 있거나 중복입니다: {id}");
+        }
+    }
+    Ok(targets)
+}
+
+/// KiCad 10의 typed footprint가 누락하는 native 객체를 디스크 쓰기 없이 검사한다.
+/// point/group/units 등은 파일 직렬화에만 나타나므로 GetItems만 믿으면 안 된다.
+fn verify_live_footprint_roundtrip(source: &str, targets: &BTreeSet<String>) -> Result<()> {
+    use konnect_sexp::SexpNode;
+    let root =
+        konnect_sexp::parse_sexp(source).context("live footprint 사전검증 원문 파싱 실패")?;
+    if root.head() != Some("kicad_pcb") {
+        anyhow::bail!("live footprint 사전검증 응답이 kicad_pcb 문서가 아닙니다");
+    }
+    let mut found = BTreeSet::new();
+    for footprint in root.find_all("footprint") {
+        let Some(id) = footprint
+            .find("uuid")
+            .and_then(|n| n.get(1))
+            .and_then(SexpNode::as_str)
+        else {
+            continue;
+        };
+        if !targets.contains(id) {
+            continue;
+        }
+        if !found.insert(id.to_owned()) {
+            anyhow::bail!("live 문서에 footprint KIID가 중복입니다: {id}");
+        }
+        for child in footprint.children().unwrap_or_default().iter().skip(2) {
+            let Some(tag) = child.head() else {
+                anyhow::bail!("footprint {id}에 표현 범위를 확인할 수 없는 원자 값이 있습니다");
+            };
+            let supported = match tag {
+                // CLIPBOARD_IO가 생성하는 포맷 표식이며 가변 객체 데이터가 아니다.
+                "version" | "generator" | "generator_version" => true,
+                "layer"
+                | "at"
+                | "uuid"
+                | "locked"
+                | "descr"
+                | "tags"
+                | "property"
+                | "path"
+                | "sheetname"
+                | "sheetfile"
+                | "solder_mask_margin"
+                | "solder_paste_margin"
+                | "solder_paste_margin_ratio"
+                | "clearance"
+                | "zone_connect"
+                | "attr"
+                | "net_tie_pad_groups"
+                | "private_layers"
+                | "duplicate_pad_numbers_are_jumpers"
+                | "jumper_pad_groups"
+                | "fp_text"
+                | "fp_text_box"
+                | "fp_line"
+                | "fp_rect"
+                | "fp_circle"
+                | "fp_arc"
+                | "fp_poly"
+                | "fp_curve"
+                | "pad"
+                | "zone"
+                | "model" => true,
+                "embedded_fonts" => child.get(1).and_then(SexpNode::as_str) == Some("no"),
+                _ => false,
+            };
+            if !supported {
+                anyhow::bail!(
+                    "무손실 footprint 교체 거부: {id}의 native 자식 '{tag}'는 KiCad 10 typed IPC 왕복 보존이 확인되지 않았습니다. 보드를 저장하고 정상 종료한 뒤 guarded closed-board MCP 경로를 사용하세요"
+                );
+            }
+            if tag == "pad" {
+                for omitted in ["property", "teardrops", "zone_layer_connections", "options"] {
+                    if child.find(omitted).is_some() {
+                        anyhow::bail!(
+                            "무손실 footprint 교체 거부: {id} 패드의 '{omitted}'는 KiCad 10 Pad protobuf가 보존하지 않습니다. guarded closed-board MCP 경로를 사용하세요"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if found != *targets {
+        anyhow::bail!("live snapshot에서 교체 대상 footprint KIID를 모두 확인하지 못했습니다");
+    }
+    Ok(())
+}
+
 fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
     let status = kiapi::common::types::ItemRequestStatus::try_from(status)
         .unwrap_or(kiapi::common::types::ItemRequestStatus::IrsUnknown);
@@ -1923,12 +2029,15 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
     ) -> Result<String> {
         let command = kiapi::common::commands::SaveDocumentToString {
-            document: Some(document),
+            document: Some(document.clone()),
         };
         let response = unpack_required::<kiapi::common::commands::SavedDocumentResponse>(
             self.send_command(&command, "kiapi.common.commands.SaveDocumentToString")?,
             "SaveDocumentToString",
         )?;
+        if response.document.as_ref() != Some(&document) {
+            anyhow::bail!("KiCad snapshot 응답의 문서 identity가 요청과 일치하지 않습니다");
+        }
         if response.contents.is_empty() {
             anyhow::bail!("KiCad returned an empty PCB snapshot");
         }
@@ -2317,6 +2426,11 @@ impl KiCadIpcClient {
     ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
+        }
+        let footprint_targets = whole_footprint_targets(&items)?;
+        if !footprint_targets.is_empty() {
+            let snapshot = self.save_document_to_string_in(document.clone())?;
+            verify_live_footprint_roundtrip(&snapshot, &footprint_targets)?;
         }
         let expected_count = items.len();
         let header = header_for(document);
@@ -4504,6 +4618,53 @@ impl KiCadIpcClient {
             copper_layer_count: resp.copper_layer_count,
             layers,
         })
+    }
+
+    /// Read the PCB editor's active layer for one exact open board.
+    pub fn get_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<kiapi::board::types::BoardLayer> {
+        let command = kiapi::board::commands::GetActiveLayer {
+            board: Some(document),
+        };
+        let response = unpack_required::<kiapi::board::commands::BoardLayerResponse>(
+            self.send_command(&command, "kiapi.board.commands.GetActiveLayer")?,
+            "GetActiveLayer",
+        )?;
+        let layer = kiapi::board::types::BoardLayer::try_from(response.layer)
+            .context("GetActiveLayer returned an unknown board layer")?;
+        if matches!(
+            layer,
+            kiapi::board::types::BoardLayer::BlUnknown
+                | kiapi::board::types::BoardLayer::BlUndefined
+                | kiapi::board::types::BoardLayer::BlUnselected
+        ) {
+            anyhow::bail!("GetActiveLayer returned a non-addressable board layer");
+        }
+        Ok(layer)
+    }
+
+    /// Set the PCB editor's active layer for one exact open board.
+    pub fn set_active_layer_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        layer: kiapi::board::types::BoardLayer,
+    ) -> Result<()> {
+        let command = kiapi::board::commands::SetActiveLayer {
+            board: Some(document),
+            layer: layer as i32,
+        };
+        let response = self
+            .send_command(&command, "kiapi.board.commands.SetActiveLayer")?
+            .context("KiCad returned no SetActiveLayer response payload")?;
+        if !response.type_url.ends_with("google.protobuf.Empty") || !response.value.is_empty() {
+            anyhow::bail!(
+                "SetActiveLayer returned unexpected response type '{}'",
+                response.type_url
+            );
+        }
+        Ok(())
     }
 
     /// As [`Self::get_enabled_layers_in`], also resolving the name KiCad shows

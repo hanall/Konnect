@@ -1159,6 +1159,132 @@ async fn handle_jlcpcb_stats(
     ))
 }
 
+/// Datasheet URL from the current or legacy LCSC product-detail response.
+///
+/// The public endpoint used `dataManualUrl` when this integration was written
+/// and now serves `pdfUrl`. Prefer the current field but retain the old one for
+/// compatible mirrors/cached responses. A string is not evidence of a usable
+/// link: accept only absolute HTTP(S) URLs with a host, without imposing a PDF
+/// suffix that the existing contract never required.
+fn lcsc_datasheet_url(response: &serde_json::Value) -> Option<String> {
+    ["/result/pdfUrl", "/result/dataManualUrl"]
+        .into_iter()
+        .filter_map(|pointer| {
+            response
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .find_map(|candidate| {
+            let authority = candidate.split_once("://")?.1;
+            if authority.is_empty() || authority.starts_with('/') {
+                return None;
+            }
+            let parsed = reqwest::Url::parse(candidate).ok()?;
+            ((parsed.scheme().eq_ignore_ascii_case("http")
+                || parsed.scheme().eq_ignore_ascii_case("https"))
+                && parsed.host_str().is_some())
+            .then(|| candidate.to_string())
+        })
+}
+
+const LCSC_PRODUCT_DETAIL_BASE: &str = "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode=";
+const LCSC_USER_AGENT: &str = concat!("Konnect/", env!("CARGO_PKG_VERSION"));
+
+fn lcsc_http_client(timeout: std::time::Duration) -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(LCSC_USER_AGENT)
+        .build()?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LcscDatasheetLookup {
+    Found(String),
+    NotFound { reason: String },
+    Unavailable { kind: &'static str, detail: String },
+}
+
+impl LcscDatasheetLookup {
+    fn diagnostic(&self, lcsc_id: &str) -> serde_json::Value {
+        match self {
+            Self::Found(url) => json!({
+                "lcsc_id": lcsc_id,
+                "status": "found",
+                "datasheet_url": url,
+            }),
+            Self::NotFound { reason } => json!({
+                "lcsc_id": lcsc_id,
+                "status": "not_found",
+                "reason": reason,
+            }),
+            Self::Unavailable { kind, detail } => json!({
+                "lcsc_id": lcsc_id,
+                "status": "unavailable",
+                "kind": kind,
+                "detail": detail,
+            }),
+        }
+    }
+}
+
+fn classify_lcsc_datasheet_response(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> LcscDatasheetLookup {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return LcscDatasheetLookup::NotFound {
+            reason: "LCSC returned HTTP 404".to_string(),
+        };
+    }
+    if !status.is_success() {
+        return LcscDatasheetLookup::Unavailable {
+            kind: "http_status",
+            detail: format!("LCSC returned HTTP {status}"),
+        };
+    }
+    let response = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(response) => response,
+        Err(error) => {
+            return LcscDatasheetLookup::Unavailable {
+                kind: "invalid_json",
+                detail: error.to_string(),
+            }
+        }
+    };
+    match lcsc_datasheet_url(&response) {
+        Some(url) => LcscDatasheetLookup::Found(url),
+        None => LcscDatasheetLookup::NotFound {
+            reason: "LCSC response contained no usable HTTP(S) datasheet URL".to_string(),
+        },
+    }
+}
+
+async fn fetch_lcsc_datasheet(client: &reqwest::Client, lcsc_id: &str) -> LcscDatasheetLookup {
+    let url = format!("{LCSC_PRODUCT_DETAIL_BASE}{lcsc_id}");
+    let response = match get_with_backoff(client, &url).await {
+        Ok(response) => response,
+        Err(error) => {
+            return LcscDatasheetLookup::Unavailable {
+                kind: "network_error",
+                detail: format!("{error:#}"),
+            }
+        }
+    };
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            return LcscDatasheetLookup::Unavailable {
+                kind: "response_read_error",
+                detail: error.to_string(),
+            }
+        }
+    };
+    classify_lcsc_datasheet_response(status, &body)
+}
+
 async fn handle_enrich_datasheets(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1194,27 +1320,22 @@ async fn handle_enrich_datasheets(
     }
 
     // Query LCSC API for datasheet URLs
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = lcsc_http_client(std::time::Duration::from_secs(30))?;
 
     let mut urls = HashMap::new();
+    let mut not_found = Vec::new();
+    let mut unavailable = Vec::new();
 
     for lcsc_id in &lcsc_ids {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            lcsc_id
-        );
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(datasheet_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
-                    }
-                }
+        match fetch_lcsc_datasheet(&client, lcsc_id).await {
+            LcscDatasheetLookup::Found(url) => {
+                urls.insert(lcsc_id.clone(), url);
+            }
+            lookup @ LcscDatasheetLookup::NotFound { .. } => {
+                not_found.push(lookup.diagnostic(lcsc_id));
+            }
+            lookup @ LcscDatasheetLookup::Unavailable { .. } => {
+                unavailable.push(lookup.diagnostic(lcsc_id));
             }
         }
     }
@@ -1240,14 +1361,28 @@ async fn handle_enrich_datasheets(
         Vec::new()
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "lcsc_ids_found": lcsc_ids.len(),
-            "datasheets_enriched": observed_updates.len(),
-            "schematic": sch_path.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let status = if unavailable.is_empty() {
+        "complete"
+    } else if observed_updates.is_empty() {
+        "failed"
+    } else {
+        "partial"
+    };
+    let body = serde_json::to_string(&json!({
+        "status": status,
+        "complete": unavailable.is_empty(),
+        "lcsc_ids_found": lcsc_ids.len(),
+        "datasheets_enriched": observed_updates.len(),
+        "not_found": not_found,
+        "unavailable": unavailable,
+        "schematic": sch_path.to_str().unwrap_or("")
+    }))
+    .unwrap();
+    Ok(if status == "failed" {
+        CallToolResult::error(body)
+    } else {
+        CallToolResult::text(body)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1653,33 +1788,35 @@ async fn handle_get_datasheet_url(
         ));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    let client = lcsc_http_client(std::time::Duration::from_secs(15))?;
+    let mut live_diagnostic = None;
 
     // Try LCSC API with lcsc_id first
     if let Some(id) = lcsc_id {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            id
-        );
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(ds_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "lcsc_id": id,
-                                "datasheet_url": ds_url,
-                                "source": "lcsc_api"
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                }
+        match fetch_lcsc_datasheet(&client, id).await {
+            LcscDatasheetLookup::Found(ds_url) => {
+                return Ok(CallToolResult::text(
+                    serde_json::to_string(&json!({
+                        "lcsc_id": id,
+                        "datasheet_url": ds_url,
+                        "source": "lcsc_api"
+                    }))
+                    .unwrap(),
+                ));
+            }
+            lookup @ LcscDatasheetLookup::Unavailable { .. } => {
+                return Ok(CallToolResult::error(
+                    serde_json::to_string(&json!({
+                        "lcsc_id": id,
+                        "datasheet_url": null,
+                        "source": "lcsc_api",
+                        "diagnostic": lookup.diagnostic(id),
+                    }))
+                    .unwrap(),
+                ));
+            }
+            lookup @ LcscDatasheetLookup::NotFound { .. } => {
+                live_diagnostic = Some(lookup.diagnostic(id));
             }
         }
     }
@@ -1700,10 +1837,150 @@ async fn handle_get_datasheet_url(
             "mpn": mpn,
             "lcsc_id": lcsc_id,
             "datasheet_url": null,
+            "diagnostic": live_diagnostic,
             "note": format!("Datasheet not found via {}", tried.join(" or "))
         }))
         .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod lcsc_datasheet_response_tests {
+    use super::*;
+
+    /// Shape captured from the public LCSC product-detail endpoint for C25804
+    /// on 2026-10-06. The live payload contains many more fields; these are the
+    /// exact fields needed to pin the current datasheet contract.
+    const CURRENT_PUBLIC_RESPONSE: &str = r#"{
+        "code": 200,
+        "msg": null,
+        "ok": true,
+        "result": {
+            "productCode": "C25804",
+            "pdfUrl": "https://datasheet.lcsc.com/datasheet/pdf/0a975aaa49b7c97f38a963127be4a823.pdf?productCode=C25804"
+        }
+    }"#;
+
+    #[test]
+    fn current_public_pdf_url_wins_over_the_legacy_field() {
+        let response: serde_json::Value = serde_json::from_str(CURRENT_PUBLIC_RESPONSE).unwrap();
+        let mut response_with_legacy = response;
+        response_with_legacy["result"]["dataManualUrl"] = json!("https://legacy.example/old.pdf");
+
+        assert_eq!(
+            lcsc_datasheet_url(&response_with_legacy).as_deref(),
+            Some("https://datasheet.lcsc.com/datasheet/pdf/0a975aaa49b7c97f38a963127be4a823.pdf?productCode=C25804")
+        );
+    }
+
+    #[test]
+    fn legacy_data_manual_url_remains_accepted() {
+        let response = json!({
+            "result": {"dataManualUrl": "http://legacy.example/component.pdf"}
+        });
+        assert_eq!(
+            lcsc_datasheet_url(&response).as_deref(),
+            Some("http://legacy.example/component.pdf")
+        );
+        assert_eq!(
+            lcsc_datasheet_url(&json!({
+                "result": {"pdfUrl": "HTTPS://EXAMPLE.COM/component"}
+            }))
+            .as_deref(),
+            Some("HTTPS://EXAMPLE.COM/component")
+        );
+    }
+
+    #[test]
+    fn blank_null_wrong_type_and_unusable_urls_are_not_datasheets() {
+        for response in [
+            json!({}),
+            json!({"result": {"pdfUrl": null}}),
+            json!({"result": {"pdfUrl": 42}}),
+            json!({"result": {"pdfUrl": "  "}}),
+            json!({"result": {"pdfUrl": "/relative.pdf"}}),
+            json!({"result": {"pdfUrl": "ftp://example.com/file.pdf"}}),
+            json!({"result": {"pdfUrl": "javascript:alert(1)"}}),
+            json!({"result": {"pdfUrl": "https:///missing-host.pdf"}}),
+        ] {
+            assert_eq!(lcsc_datasheet_url(&response), None, "{response}");
+        }
+    }
+
+    #[test]
+    fn unusable_primary_falls_back_to_a_usable_legacy_url() {
+        let response = json!({
+            "result": {
+                "pdfUrl": "not a URL",
+                "dataManualUrl": "https://legacy.example/fallback.pdf"
+            }
+        });
+        assert_eq!(
+            lcsc_datasheet_url(&response).as_deref(),
+            Some("https://legacy.example/fallback.pdf")
+        );
+    }
+
+    #[test]
+    fn http_and_json_failures_are_not_collapsed_into_not_found() {
+        assert!(matches!(
+            classify_lcsc_datasheet_response(
+                reqwest::StatusCode::FORBIDDEN,
+                "<html>forbidden</html>"
+            ),
+            LcscDatasheetLookup::Unavailable {
+                kind: "http_status",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_lcsc_datasheet_response(reqwest::StatusCode::OK, "not-json"),
+            LcscDatasheetLookup::Unavailable {
+                kind: "invalid_json",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_lcsc_datasheet_response(reqwest::StatusCode::NOT_FOUND, ""),
+            LcscDatasheetLookup::NotFound { .. }
+        ));
+        assert!(matches!(
+            classify_lcsc_datasheet_response(reqwest::StatusCode::OK, r#"{"result":{}}"#),
+            LcscDatasheetLookup::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lcsc_client_sends_the_product_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0u8; 4096];
+            let read = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes[..read]).to_string()
+        });
+        let client = lcsc_http_client(std::time::Duration::from_secs(2)).unwrap();
+        client
+            .get(format!("http://{address}/detail"))
+            .send()
+            .await
+            .unwrap();
+        let request = request.await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&format!("user-agent: {LCSC_USER_AGENT}"))),
+            "request carried no product User-Agent: {request}"
+        );
+    }
 }
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────

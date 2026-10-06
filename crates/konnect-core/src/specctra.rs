@@ -5,14 +5,14 @@
 //! file. The first supported profile is intentionally narrow and rejects
 //! every feature it cannot represent without approximation.
 
+use crate::specctra_format::read_complete_dsn;
+use crate::specctra_format::structure as dsn;
+use crate::specctra_format::write::{ListWriter, WriteSes};
 use anyhow::{bail, Context, Result};
 use konnect_ipc::IpcEffectiveRoutingRules;
 use konnect_sexp::{parse_sexp, SexpNode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use specctra::read::{ListTokenizer, ReadDsn};
-use specctra::structure as dsn;
-use specctra::write::{ListWriter, WriteSes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -412,8 +412,7 @@ struct DsnIdentity {
 
 fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
     let cursor = Cursor::new(source.as_bytes());
-    let mut tokenizer = ListTokenizer::new(BufReader::new(cursor));
-    dsn::DsnFile::read_dsn(&mut tokenizer)
+    read_complete_dsn(BufReader::new(cursor))
         .map_err(|error| anyhow::anyhow!("{label} failed Specctra parser validation: {error}"))?;
     Ok(())
 }
@@ -423,7 +422,8 @@ fn parse_dsn_sexp(source: &str) -> Result<SexpNode> {
     // `(string_quote ")`. KiCad's S-expression parser correctly treats the
     // opening quote as a string delimiter, so give only this metadata token an
     // escaped representation for structural inspection. The original DSN is
-    // retained byte-for-byte and independently validated by Topola's parser.
+    // retained byte-for-byte and independently validated by the Specctra
+    // schema parser.
     let compatible = source.replace("(string_quote \")", "(string_quote \"\\\"\")");
     parse_sexp(&compatible).context("parse normalized Specctra S-expression")
 }
@@ -1458,8 +1458,7 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
     text.push('\n');
 
     let cursor = Cursor::new(text.as_bytes());
-    let mut tokenizer = ListTokenizer::new(BufReader::new(cursor));
-    dsn::DsnFile::read_dsn(&mut tokenizer)
+    read_complete_dsn(BufReader::new(cursor))
         .map_err(|error| anyhow::anyhow!("generated DSN failed parser round-trip: {error}"))?;
     Ok(text)
 }
@@ -1643,6 +1642,24 @@ mod tests {
     use super::*;
     use konnect_ipc::IpcRoutingRules;
 
+    const UPSTREAM_GOLDEN_PACKAGE_VERSION: &str = "0.13.0";
+    const UPSTREAM_GOLDEN_DSN_SHA256: &str =
+        "35f538d5481f9cb7fce1b5389e01cd879bfcf729510fcddf1fb18531b006d973";
+
+    fn normalize_host_version_for_upstream_golden(dsn: &str) -> String {
+        let current = format!("(host_version {})", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            dsn.matches(&current).count(),
+            1,
+            "generated DSN must carry the exact current package version once"
+        );
+        dsn.replacen(
+            &current,
+            &format!("(host_version {UPSTREAM_GOLDEN_PACKAGE_VERSION})"),
+            1,
+        )
+    }
+
     fn rules() -> IpcEffectiveRoutingRules {
         ["GND", "VCC"]
             .into_iter()
@@ -1676,6 +1693,15 @@ mod tests {
         let first = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
         let second = export_dsn(Path::new("board.kicad_pcb"), source, &rules()).unwrap();
 
+        let upstream_normalized = normalize_host_version_for_upstream_golden(&first.dsn);
+        read_complete_dsn(BufReader::new(Cursor::new(upstream_normalized.as_bytes())))
+            .expect("version-normalized DSN must remain parser-valid");
+        assert_eq!(
+            sha256_hex(upstream_normalized.as_bytes()),
+            UPSTREAM_GOLDEN_DSN_SHA256,
+            "all bytes except package-version provenance must preserve the upstream golden"
+        );
+
         assert_eq!(first.dsn, second.dsn);
         assert_eq!(first.manifest, second.manifest);
         assert_eq!(first.component_count, 2);
@@ -1696,8 +1722,7 @@ mod tests {
     #[test]
     fn freerouting_owned_dsn_corpus_parses() {
         let source = include_str!("../tests/fixtures/freerouting_issue269_minimal_v2_3_0.dsn");
-        let mut tokenizer = ListTokenizer::new(BufReader::new(Cursor::new(source.as_bytes())));
-        dsn::DsnFile::read_dsn(&mut tokenizer)
+        read_complete_dsn(BufReader::new(Cursor::new(source.as_bytes())))
             .expect("Freerouting v2.3.0 corpus fixture must remain parseable");
     }
 

@@ -20,7 +20,7 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 | S-expression engine | `crates/konnect-sexp` | KiCad file parsing/writing, atomic edits, reversible commands, and transaction journals |
 | Typed schematic editor | `crates/konnect-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
 | KiCad IPC client | `crates/konnect-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
-| Schematic viewer | `crates/schematic-viewer` | Separate Tauri application for live schematic rendering |
+| Schematic viewer | `crates/schematic-viewer` | `127.0.0.1` capability URL을 시스템 브라우저로 여는 격리 snapshot live renderer |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
 

@@ -201,7 +201,12 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        // These two paths were already unconstrained `{}` values. Keep the
+                        // existing arbitrary non-null JSON contract while advertising its
+                        // accepted kinds; only the value's caller-owned object is open.
+                        "save_user_config/properties/value" |
+                        "save_project_config/properties/value"
                     ),
                         "unreviewed open input record: {path}"
                     );

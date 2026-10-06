@@ -1,0 +1,175 @@
+// SPDX-FileCopyrightText: 2024 Topola contributors
+//
+// SPDX-License-Identifier: MIT
+
+use super::ListToken;
+use std::io;
+
+pub trait WriteSes<W: io::Write> {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error>;
+}
+
+impl<W: io::Write> WriteSes<W> for char {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for String {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        let string = if self.is_empty() {
+            "\"\"".to_string()
+        } else if self.contains([' ', '(', ')', '\n']) {
+            format!("\"{}\"", self)
+        } else {
+            self.to_string()
+        };
+        writer.write_leaf(string)
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for bool {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(
+            match self {
+                true => "on",
+                false => "off",
+            }
+            .to_string(),
+        )
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for i32 {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for u32 {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for usize {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for f32 {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+impl<W: io::Write> WriteSes<W> for f64 {
+    fn write_dsn(&self, writer: &mut ListWriter<W>) -> Result<(), io::Error> {
+        writer.write_leaf(self.to_string())
+    }
+}
+
+pub struct ListWriter<W> {
+    writable: W,
+    indent_level: usize,
+    multiline_level: usize,
+    pub line_len: usize,
+}
+
+impl<W> ListWriter<W> {
+    pub fn new(writable: W) -> Self {
+        Self {
+            writable,
+            indent_level: 0,
+            multiline_level: 0,
+            line_len: 0,
+        }
+    }
+}
+
+impl<W: io::Write> ListWriter<W> {
+    pub fn write_token(&mut self, token: ListToken) -> Result<(), io::Error> {
+        let len = token.len();
+
+        match token {
+            ListToken::Start { name } => {
+                write!(
+                    self.writable,
+                    "\n{}({}",
+                    "  ".repeat(self.indent_level),
+                    name
+                )?;
+                self.multiline_level = self.indent_level;
+                self.line_len = 2 * self.indent_level + len;
+                self.indent_level += 1;
+                Ok(())
+            }
+            ListToken::Leaf { value } => {
+                self.line_len += 1 + len;
+                write!(self.writable, " {}", value)
+            }
+            ListToken::End => {
+                if self.indent_level <= self.multiline_level {
+                    self.indent_level -= 1;
+                    self.line_len = 2 * self.indent_level + len;
+                    write!(self.writable, "\n{})", "  ".repeat(self.indent_level))
+                } else {
+                    self.indent_level -= 1;
+                    self.line_len += len;
+                    write!(self.writable, ")")
+                }
+            }
+        }
+    }
+
+    pub fn write_leaf(&mut self, value: String) -> Result<(), io::Error> {
+        self.write_token(ListToken::Leaf { value })
+    }
+
+    pub fn write_value<T: WriteSes<W>>(&mut self, value: &T) -> Result<(), io::Error> {
+        value.write_dsn(self)
+    }
+
+    pub fn write_named<T: WriteSes<W>>(&mut self, name: &str, value: &T) -> Result<(), io::Error> {
+        self.write_token(ListToken::Start {
+            name: name.to_string(),
+        })?;
+        self.write_value(value)?;
+        self.write_token(ListToken::End)?;
+
+        Ok(())
+    }
+
+    pub fn write_optional<T: WriteSes<W>>(
+        &mut self,
+        name: &str,
+        optional: &Option<T>,
+    ) -> Result<(), io::Error> {
+        if let Some(value) = optional {
+            self.write_named(name, value)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_array<T: WriteSes<W>>(&mut self, array: &[T]) -> Result<(), io::Error> {
+        for elem in array {
+            self.write_value(elem)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_named_array<T: WriteSes<W>>(
+        &mut self,
+        name: &str,
+        array: &[T],
+    ) -> Result<(), io::Error> {
+        for elem in array {
+            self.write_named(name, elem)?;
+        }
+
+        Ok(())
+    }
+}

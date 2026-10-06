@@ -575,29 +575,30 @@ async fn handle_open_viewer(
             cmd.arg(&sch_path);
 
             match launch_viewer(cmd, VIEWER_STARTUP_WINDOW).await {
-                Ok(()) => Ok(CallToolResult::text(
-                    serde_json::to_string(&json!({
-                        "launched": true,
-                        "viewer": viewer_path.to_str().unwrap_or(""),
-                        "schematic": sch_path.to_str().unwrap_or(""),
-                        "note": "Schematic viewer opened. It will auto-refresh as you make changes to the schematic file."
-                    }))
-                    .unwrap(),
-                )),
+                Ok(ready) => Ok(CallToolResult::json(&json!({
+                    "launched": true,
+                    "ready": true,
+                    "viewer": viewer_path.to_str().unwrap_or(""),
+                    "schematic": sch_path.to_str().unwrap_or(""),
+                    "url": ready.url,
+                    "viewer_pid": ready.pid,
+                    "health": ready.health,
+                    "note": "A browser loaded the capability URL after the root schematic rendered from an isolated snapshot and the auto-refresh watcher became active."
+                }))),
                 Err(message) => Ok(CallToolResult::error(message)),
             }
         }
         None => Ok(CallToolResult::error(
-            "Schematic viewer binary (schematic-viewer.exe) not found. \
-             It should be in the same directory as konnect.exe.",
+            "Trusted schematic-viewer binary not found. It must be a regular, \
+             non-symlink executable in the same directory as the konnect binary.",
         )),
     }
 }
 
-/// How long the viewer must stay up before it counts as launched. A viewer
-/// that cannot open a window, such as one started without a display on Linux,
-/// exits well inside this (#702).
-const VIEWER_STARTUP_WINDOW: Duration = Duration::from_secs(1);
+/// Maximum wait for the viewer's authenticated browser-connect readiness.
+/// Rendering a large hierarchy may take several seconds before the loopback
+/// server opens the browser and observes its page, state, and SVG requests.
+const VIEWER_STARTUP_WINDOW: Duration = Duration::from_secs(60);
 
 /// Stderr lines quoted when the viewer exits during startup, and the length
 /// each is cut to, so a huge panic message cannot flood the tool result.
@@ -608,10 +609,33 @@ const VIEWER_STDERR_LINE_CHARS: usize = 500;
 /// render the viewer started can hold the pipe open after the viewer exits.
 const VIEWER_STDERR_DRAIN: Duration = Duration::from_millis(500);
 
-/// Spawns the viewer and watches it for `window`. A successful `spawn()` only
-/// means `exec` worked, so an exit inside the window is a failed launch,
-/// reported with the exit status and the tail of the viewer's stderr.
-async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Result<(), String> {
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ViewerLaunch {
+    url: String,
+    pid: u32,
+    health: ViewerHealth,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ViewerHealth {
+    bind: String,
+    browser_connected: bool,
+    root_rendered: bool,
+    auto_refresh_watcher: bool,
+    source: String,
+    total_sheets: usize,
+    rendered_sheets: usize,
+    render_errors: usize,
+    render_warnings: usize,
+}
+
+/// Spawns the viewer and waits for its authenticated browser-connect
+/// readiness record. Process liveness alone is not evidence that a browser
+/// loaded the viewer or that its root render and watcher are ready.
+async fn launch_viewer(
+    mut cmd: std::process::Command,
+    window: Duration,
+) -> Result<ViewerLaunch, String> {
     use std::collections::VecDeque;
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
@@ -626,18 +650,32 @@ async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Resu
     let mut child = tokio::process::Command::from(cmd)
         .spawn()
         .map_err(|e| format!("Failed to launch viewer: {e}"))?;
+    let child_pid = child
+        .id()
+        .ok_or_else(|| "Failed to obtain the viewer process ID".to_string())?;
 
     let tail = Arc::new(Mutex::new(VecDeque::new()));
+    let (readiness_sender, readiness_receiver) = tokio::sync::oneshot::channel();
     let forwarder = child.stderr.take().map(|stderr| {
         let tail = Arc::clone(&tail);
         tokio::spawn(async move {
+            let mut readiness_sender = Some(readiness_sender);
             let mut lines = tokio::io::BufReader::new(stderr).split(b'\n');
             while let Ok(Some(line)) = lines.next_segment().await {
                 let line = String::from_utf8_lossy(&line).trim_end().to_string();
                 if line.is_empty() {
                     continue;
                 }
-                tracing::warn!(target: "schematic_viewer", "{line}");
+                if let Some(payload) = line.strip_prefix("KONNECT_VIEWER_READY ") {
+                    let parsed = serde_json::from_str::<ViewerLaunch>(payload)
+                        .map_err(|error| format!("Malformed viewer readiness record: {error}"));
+                    if let Some(sender) = readiness_sender.take() {
+                        let _ = sender.send(parsed);
+                    }
+                    tracing::info!(target: "schematic_viewer", "{line}");
+                } else {
+                    tracing::warn!(target: "schematic_viewer", "{line}");
+                }
                 // Once the caller has returned, nobody reads the tail.
                 if Arc::strong_count(&tail) == 1 {
                     continue;
@@ -656,49 +694,166 @@ async fn launch_viewer(mut cmd: std::process::Command, window: Duration) -> Resu
         })
     });
 
-    let status = match tokio::time::timeout(window, child.wait()).await {
-        Err(_still_running) => return Ok(()),
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(format!("Failed to check the viewer process: {e}")),
-    };
-
-    if let Some(forwarder) = forwarder {
-        let _ = tokio::time::timeout(VIEWER_STDERR_DRAIN, forwarder).await;
+    enum Startup {
+        Ready(Result<ViewerLaunch, String>),
+        ReadinessPipeClosed,
+        Exited(Result<std::process::ExitStatus, std::io::Error>),
+        Timeout,
     }
+    let startup = {
+        let wait = child.wait();
+        tokio::pin!(wait);
+        tokio::select! {
+            readiness = readiness_receiver => match readiness {
+                Ok(readiness) => Startup::Ready(readiness),
+                Err(_) => Startup::ReadinessPipeClosed,
+            },
+            status = &mut wait => Startup::Exited(status),
+            _ = tokio::time::sleep(window) => Startup::Timeout,
+        }
+    };
+    match startup {
+        Startup::Ready(Ok(ready)) => {
+            if let Err(error) = validate_viewer_readiness(&ready, child_pid) {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(error)
+            } else {
+                tokio::spawn(async move {
+                    match child.wait().await {
+                        Ok(status) => tracing::info!(
+                            target: "schematic_viewer",
+                            "viewer process {child_pid} exited with {status}"
+                        ),
+                        Err(error) => tracing::warn!(
+                            target: "schematic_viewer",
+                            "failed to reap viewer process {child_pid}: {error}"
+                        ),
+                    }
+                });
+                Ok(ready)
+            }
+        }
+        Startup::Ready(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error)
+        }
+        Startup::Timeout => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(format!(
+                "Schematic viewer did not report browser readiness within {} seconds.",
+                window.as_secs_f64()
+            ))
+        }
+        Startup::ReadinessPipeClosed => {
+            match tokio::time::timeout(VIEWER_STDERR_DRAIN, child.wait()).await {
+                Ok(Ok(status)) => {
+                    if let Some(forwarder) = forwarder {
+                        let _ = tokio::time::timeout(VIEWER_STDERR_DRAIN, forwarder).await;
+                    }
+                    Err(viewer_exit_message(status, &tail))
+                }
+                Ok(Err(error)) => Err(format!("Failed to check the viewer process: {error}")),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    Err(
+                        "Schematic viewer closed its diagnostic pipe before browser readiness."
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        Startup::Exited(status) => {
+            let status = status.map_err(|e| format!("Failed to check the viewer process: {e}"))?;
+            if let Some(forwarder) = forwarder {
+                let _ = tokio::time::timeout(VIEWER_STDERR_DRAIN, forwarder).await;
+            }
+            Err(viewer_exit_message(status, &tail))
+        }
+    }
+}
+
+fn viewer_exit_message(
+    status: std::process::ExitStatus,
+    tail: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+) -> String {
     let tail = tail
         .lock()
         .map(|mut tail| tail.make_contiguous().join("\n"))
         .unwrap_or_default();
-    Err(if tail.is_empty() {
+    if tail.is_empty() {
         format!("Schematic viewer exited during startup ({status}) with no stderr output.")
     } else {
         format!("Schematic viewer exited during startup ({status}). Its stderr ended with:\n{tail}")
-    })
+    }
 }
 
 fn find_viewer_binary() -> Option<std::path::PathBuf> {
-    // Check next to the current executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        let dir = exe_path.parent()?;
-        let viewer = dir.join(if cfg!(target_os = "windows") {
-            "schematic-viewer.exe"
-        } else {
-            "schematic-viewer"
-        });
-        if viewer.exists() {
-            return Some(viewer);
-        }
-    }
+    viewer_binary_next_to(&std::env::current_exe().ok()?)
+}
 
-    // Check common locations
-    let candidates = ["schematic-viewer.exe", "schematic-viewer"];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
+fn viewer_binary_next_to(executable: &Path) -> Option<PathBuf> {
+    let viewer = executable.parent()?.join(if cfg!(target_os = "windows") {
+        "schematic-viewer.exe"
+    } else {
+        "schematic-viewer"
+    });
+    let metadata = std::fs::symlink_metadata(&viewer).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
         }
     }
-    None
+    Some(viewer)
+}
+
+fn validate_viewer_readiness(ready: &ViewerLaunch, child_pid: u32) -> Result<(), String> {
+    if ready.pid != child_pid {
+        return Err(format!(
+            "Viewer readiness PID {} does not match child PID {child_pid}",
+            ready.pid
+        ));
+    }
+    if ready.health.bind != "127.0.0.1"
+        || !ready.health.browser_connected
+        || !ready.health.root_rendered
+        || !ready.health.auto_refresh_watcher
+        || ready.health.source != "isolated_snapshot"
+        || ready.health.total_sheets == 0
+        || ready.health.rendered_sheets == 0
+        || ready.health.rendered_sheets > ready.health.total_sheets
+    {
+        return Err("Viewer readiness health contract is incomplete".to_string());
+    }
+    let rest = ready
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| "Viewer readiness URL is not loopback HTTP".to_string())?;
+    let (port, capability) = rest
+        .split_once('/')
+        .ok_or_else(|| "Viewer readiness URL is malformed".to_string())?;
+    if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        return Err("Viewer readiness URL has an invalid port".to_string());
+    }
+    let capability = capability
+        .strip_suffix('/')
+        .ok_or_else(|| "Viewer readiness URL must end with a slash".to_string())?;
+    if capability.len() != 64
+        || !capability
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Viewer readiness URL has an invalid capability token".to_string());
+    }
+    Ok(())
 }
 
 // ─── Blank file templates ──────────────────────────────────────────────────────
@@ -1851,10 +2006,37 @@ mod viewer_launch_tests {
     }
 
     #[tokio::test]
-    async fn a_viewer_still_running_after_the_window_is_launched() {
-        launch_viewer(sh("sleep 3"), Duration::from_millis(200))
+    async fn a_running_viewer_without_browser_readiness_is_a_failed_launch() {
+        let error = launch_viewer(sh("sleep 3"), Duration::from_millis(200))
             .await
-            .expect("a viewer that outlives the window is up");
+            .expect_err("process liveness alone is not browser readiness");
+        assert!(error.contains("readiness"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn exact_loopback_browser_readiness_is_required_and_returned() {
+        let token = "a".repeat(64);
+        let script = format!(
+            "echo 'KONNECT_VIEWER_READY {{\"url\":\"http://127.0.0.1:43210/{token}/\",\"pid\":'$$',\"health\":{{\"bind\":\"127.0.0.1\",\"browser_connected\":true,\"root_rendered\":true,\"auto_refresh_watcher\":true,\"source\":\"isolated_snapshot\",\"total_sheets\":1,\"rendered_sheets\":1,\"render_errors\":0,\"render_warnings\":0}}}}' >&2; sleep 0.05"
+        );
+        let ready = launch_viewer(sh(&script), Duration::from_secs(2))
+            .await
+            .expect("complete readiness record");
+        assert_eq!(ready.url, format!("http://127.0.0.1:43210/{token}/"));
+        assert!(ready.health.browser_connected);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn readiness_from_a_different_pid_is_rejected() {
+        let token = "a".repeat(64);
+        let script = format!(
+            "echo 'KONNECT_VIEWER_READY {{\"url\":\"http://127.0.0.1:43210/{token}/\",\"pid\":1,\"health\":{{\"bind\":\"127.0.0.1\",\"browser_connected\":true,\"root_rendered\":true,\"auto_refresh_watcher\":true,\"source\":\"isolated_snapshot\",\"total_sheets\":1,\"rendered_sheets\":1,\"render_errors\":0,\"render_warnings\":0}}}}' >&2; sleep 3"
+        );
+        let error = launch_viewer(sh(&script), Duration::from_secs(2))
+            .await
+            .expect_err("forged readiness PID");
+        assert!(error.contains("does not match child PID"), "{error}");
     }
 
     #[tokio::test]
@@ -1866,5 +2048,30 @@ mod viewer_launch_tests {
         .await
         .unwrap_err();
         assert!(err.starts_with("Failed to launch viewer:"), "{err}");
+    }
+
+    #[test]
+    fn viewer_binary_discovery_rejects_symlinks_and_non_executable_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temporary = tempfile::TempDir::new().unwrap();
+        let executable = temporary.path().join("konnect");
+        std::fs::write(&executable, "server").unwrap();
+        let viewer = temporary.path().join("schematic-viewer");
+        std::fs::write(&viewer, "viewer").unwrap();
+        assert!(super::viewer_binary_next_to(&executable).is_none());
+
+        let mut permissions = std::fs::metadata(&viewer).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&viewer, permissions).unwrap();
+        assert_eq!(
+            super::viewer_binary_next_to(&executable),
+            Some(viewer.clone())
+        );
+
+        std::fs::remove_file(&viewer).unwrap();
+        let target = temporary.path().join("real-viewer");
+        std::fs::write(&target, "viewer").unwrap();
+        symlink(target, &viewer).unwrap();
+        assert!(super::viewer_binary_next_to(&executable).is_none());
     }
 }

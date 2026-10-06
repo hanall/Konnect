@@ -52,12 +52,13 @@ open-document set, an ambiguous document set, and a request KiCad rejected.
 
 ### Non-workspace and non-Rust boundaries
 
-`crates/schematic-viewer` is a separate Tauri application and is deliberately
-outside the Cargo workspace. `plugin` is the thin Python KiCad integration
-layer. `packaging` contains the PCM build scripts, metadata, schema, and package
-validation. Bundled AI guidance under `crates/konnect/assets/skills` and
-`assets/agents` is user-facing workflow behavior and must track the tools it
-names.
+`crates/schematic-viewer`는 자체 `Cargo.lock`을 사용하는 독립 Rust binary이며
+의도적으로 Cargo workspace 밖에 둡니다. 이 binary는 외부 주소에 bind하지 않고
+`127.0.0.1`의 OS 할당 port와 256-bit capability token을 사용해 시스템 브라우저에
+SVG viewer를 제공합니다. `plugin`은 얇은 Python KiCad integration layer입니다.
+`packaging`은 PCM build script, metadata, schema, package validation을 포함합니다.
+`crates/konnect/assets/skills`와 `assets/agents`의 bundled AI guidance는 사용자
+workflow이므로 자신이 지칭하는 tool과 동기화해야 합니다.
 
 ## Server Startup
 

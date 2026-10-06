@@ -80,6 +80,21 @@ pub(crate) fn resolve_footprint_file(lib_id: &str, board_path: &Path) -> anyhow:
         .map_err(|message| anyhow::anyhow!(message))
 }
 
+/// Explain why the complete library object graph cannot be sent through
+/// KiCad 10's typed footprint messages.  File fallbacks do not call this:
+/// they forward the original S-expression and therefore retain these items.
+pub(crate) fn validate_typed_ipc_footprint_source(source: &str) -> anyhow::Result<()> {
+    let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+    super::library_footprint::validate_typed_ipc_direct_children(&root)?;
+    super::pcb_footprint_update::validate_supported_children(&root)
+}
+
+fn typed_ipc_footprint_error(source: &str) -> Option<String> {
+    validate_typed_ipc_footprint_source(source)
+        .err()
+        .map(|error| format!("{error:#}"))
+}
+
 /// Structured rejection for any back-side (`B.*`) placement layer.
 ///
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
@@ -560,32 +575,25 @@ fn extract_graphic_definitions_with_properties(
 // failed dial/send): a live KiCad must never have the board file edited
 // behind its back. Ported from emolitor's PR #66.
 
-/// Build a board-ready `(footprint …)` block for `lib_id`.
-///
-/// A library `.kicad_mod` is a complete footprint definition sitting at the
-/// origin with a `REF**` placeholder reference. Placing it on a board means
-/// renaming it to the full `Library:Footprint` id, stamping in a position,
-/// rotation and fresh UUID, and substituting the real reference designator.
-///
-/// KiCAD's own parser then handles the pads and graphics, which is why the
-/// whole definition is forwarded rather than reconstructed.
-fn board_footprint_sexp(
+/// Convert the exact library bytes already bound by a caller's plan into a
+/// board footprint.  Keeping this separate from resolution prevents a second
+/// library read from escaping a dry-run/apply revision.  The full source is
+/// forwarded, including children that KiCad 10's typed IPC cannot represent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn board_footprint_sexp_from_source(
+    content: &str,
     lib_id: &str,
+    source_path: &Path,
     x: f64,
     y: f64,
     rotation: f64,
     layer: &str,
     reference: Option<&str>,
-    project_dir: Option<&Path>,
 ) -> Result<String, String> {
-    let path = resolve_footprint_path(lib_id, project_dir)?;
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
-
-    let name_span = footprint_name_span(&content).ok_or_else(|| {
+    let name_span = footprint_name_span(content).ok_or_else(|| {
         format!(
             "{} does not start with a (footprint \"NAME\" …) block",
-            path.display()
+            source_path.display()
         )
     })?;
 
@@ -594,7 +602,11 @@ fn board_footprint_sexp(
     let declared = &content[name_span.start + 1..name_span.end - 1];
     let mut out = String::with_capacity(content.len() + 128);
     out.push_str(&content[..name_span.start]);
-    out.push_str(&quote_sexp_string(&board_lib_id(lib_id, &path, declared)));
+    out.push_str(&quote_sexp_string(&board_lib_id(
+        lib_id,
+        source_path,
+        declared,
+    )));
     out.push_str(&format!(
         "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
         new_uuid()
@@ -891,6 +903,11 @@ pub(crate) struct PreparedFootprintPlacement {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    definition_attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
+    library_fields: Vec<konnect_ipc::gen::kiapi::board::types::Field>,
+    models: Vec<konnect_ipc::gen::kiapi::board::types::Footprint3DModel>,
+    typed_error: Option<String>,
     board_sexp: String,
 }
 
@@ -907,14 +924,84 @@ impl PreparedFootprintPlacement {
         layer: &str,
         project_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        let prepared =
-            prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
-        let pads = extract_pad_definitions(&prepared)?;
-        let graphics = extract_graphic_definitions(&prepared)?;
-        let fields = extract_field_placement(&prepared);
-        let board_sexp =
-            board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
-                .map_err(anyhow::Error::msg)?;
+        let source_path =
+            resolve_footprint_path(lib_id, project_dir).map_err(anyhow::Error::msg)?;
+        let board_sexp = board_footprint_sexp_from_source(
+            source,
+            lib_id,
+            &source_path,
+            x,
+            y,
+            rotation,
+            layer,
+            Some(reference),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let typed = (|| -> anyhow::Result<_> {
+            validate_typed_ipc_footprint_source(source)?;
+            let prepared =
+                prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
+            let pads = extract_pad_definitions(&prepared)?;
+            let graphics = extract_graphic_definitions_without_properties(&prepared)?;
+            let fields = extract_field_placement(&prepared);
+            let root =
+                konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+            // This validates duplicate property names while the typed field
+            // parser below preserves every property's authored presentation.
+            super::pcb_footprint_update::parse_library_properties(&root)?;
+            let attributes = super::library_footprint::attributes(&root)?;
+            let definition_attributes = super::library_footprint::description_and_keywords(&root);
+            let library_fields = super::pcb_footprint_update::parse_typed_library_fields(&root)?;
+            let models = super::library_footprint::models(&root)?;
+            Ok((
+                pads,
+                graphics,
+                fields,
+                attributes,
+                definition_attributes,
+                library_fields,
+                models,
+            ))
+        })();
+        let (
+            pads,
+            graphics,
+            fields,
+            attributes,
+            definition_attributes,
+            library_fields,
+            models,
+            typed_error,
+        ) = match typed {
+            Ok((
+                pads,
+                graphics,
+                fields,
+                attributes,
+                definition_attributes,
+                library_fields,
+                models,
+            )) => (
+                pads,
+                graphics,
+                fields,
+                attributes,
+                definition_attributes,
+                library_fields,
+                models,
+                None,
+            ),
+            Err(error) => (
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("{error:#}")),
+            ),
+        };
         let value = value.map(str::to_string).unwrap_or_else(|| {
             lib_id
                 .split_once(':')
@@ -926,6 +1013,11 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            attributes,
+            definition_attributes,
+            library_fields,
+            models,
+            typed_error,
             board_sexp,
         })
     }
@@ -942,6 +1034,11 @@ impl PreparedFootprintPlacement {
             pads,
             graphics,
             fields,
+            attributes: Default::default(),
+            definition_attributes: Default::default(),
+            library_fields: Vec::new(),
+            models: Vec::new(),
+            typed_error: None,
             board_sexp,
         }
     }
@@ -951,6 +1048,123 @@ impl PreparedFootprintPlacement {
     pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
         insert_into_board(board_path, std::slice::from_ref(&self.board_sexp))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_ipc_item(
+        &self,
+        lib_id: &str,
+        reference: &str,
+        value: &str,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+    ) -> anyhow::Result<prost_types::Any> {
+        if let Some(error) = &self.typed_error {
+            anyhow::bail!(
+                "library footprint cannot be represented losslessly through typed IPC: {error}"
+            );
+        }
+        let packed = KiCadIpcClient::build_footprint_item(
+            lib_id,
+            reference,
+            value,
+            &self.pads,
+            &self.graphics,
+            &self.fields,
+            x,
+            y,
+            rotation,
+            layer,
+        )?;
+        let mut footprint = konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+            packed.value.as_slice(),
+        )?;
+        footprint.attributes = Some(self.attributes.clone());
+        let definition = footprint
+            .definition
+            .as_mut()
+            .context("typed footprint builder returned no definition")?;
+        definition.attributes = Some(self.definition_attributes.clone());
+        definition.items.extend(self.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }));
+
+        let position = footprint.position.as_ref().cloned().unwrap_or_default();
+        let is_back = layer == "B.Cu";
+        for field in &self.library_fields {
+            let mut field = super::pcb_footprint_update::transform_library_property(
+                field, &position, rotation, is_back,
+            )?;
+            if field.name == "Reference" {
+                set_typed_field_text(&mut field, reference)?;
+                definition.reference_field = Some(field.clone());
+                footprint.reference_field = Some(field);
+            } else if field.name == "Value" {
+                set_typed_field_text(&mut field, value)?;
+                definition.value_field = Some(field.clone());
+                footprint.value_field = Some(field);
+            } else if field.name == "Datasheet" {
+                definition.datasheet_field = Some(field.clone());
+                footprint.datasheet_field = Some(field);
+            } else if field.name == "Description" {
+                definition.description_field = Some(field.clone());
+                footprint.description_field = Some(field);
+            } else {
+                definition.items.push(konnect_ipc::builders::pack_any(
+                    &field,
+                    "kiapi.board.types.Field",
+                ));
+            }
+        }
+        Ok(konnect_ipc::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
+}
+
+fn set_typed_field_text(
+    field: &mut konnect_ipc::gen::kiapi::board::types::Field,
+    value: &str,
+) -> anyhow::Result<()> {
+    field
+        .text
+        .as_mut()
+        .and_then(|text| text.text.as_mut())
+        .context("typed library field has no text")?
+        .text = value.to_string();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_prepared_footprint(
+    client: &KiCadIpcClient,
+    board: &Path,
+    prepared: &PreparedFootprintPlacement,
+    lib_id: &str,
+    reference: &str,
+    value: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    layer: &str,
+) -> anyhow::Result<konnect_ipc::IpcFootprint> {
+    let document = client.find_open_board(board)?;
+    if client
+        .list_footprints_in(document.clone())?
+        .iter()
+        .any(|footprint| footprint.reference == reference)
+    {
+        anyhow::bail!("footprint reference '{reference}' already exists on the board");
+    }
+    let item = prepared.build_ipc_item(lib_id, reference, value, x, y, rotation, layer)?;
+    client.create_items_in(document.clone(), vec![item])?;
+    client
+        .list_footprints_in(document)?
+        .into_iter()
+        .find(|footprint| footprint.reference == reference)
+        .with_context(|| format!("placed footprint '{reference}' is absent from live readback"))
 }
 
 fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
@@ -2212,6 +2426,7 @@ async fn handle_place_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let typed_ipc_error = typed_ipc_footprint_error(&source);
     let prepared = match PreparedFootprintPlacement::from_library(
         &source,
         &footprint,
@@ -2237,14 +2452,18 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
-        c.place_footprint(
+        if let Some(reason) = typed_ipc_error.as_deref() {
+            anyhow::bail!(
+                "the library footprint cannot be placed losslessly through KiCad 10 typed IPC: {reason}"
+            );
+        }
+        place_prepared_footprint(
+            c,
             &requested_board,
+            &prepared_ipc,
             &footprint_ipc,
             &reference_ipc,
             &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
             x,
             y,
             rotation,
@@ -3019,6 +3238,14 @@ async fn handle_repair_corrupted_footprints(
                         continue;
                     }
                 };
+                if let Err(error) = validate_typed_ipc_footprint_source(&source) {
+                    diagnostics.push(json!({
+                        "reference": reference,
+                        "code": "unsupported_library_footprint",
+                        "message": format!("{error:#}")
+                    }));
+                    continue;
+                }
                 let pads = match extract_pad_definitions(&source) {
                     Ok(pads) => pads,
                     Err(error) => {
@@ -3678,14 +3905,11 @@ async fn handle_place_array(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    // Graphics are footprint-local and identical for every array instance, so
-    // one extraction serves the whole batch.
-    let graphics = match extract_graphic_definitions(&source) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&source);
-
+    if let Some(reason) = typed_ipc_footprint_error(&source) {
+        return Ok(CallToolResult::error(format!(
+            "The footprint array was not placed: KiCad 10 typed IPC cannot represent the complete library footprint: {reason}"
+        )));
+    }
     let value = footprint
         .split_once(':')
         .map(|(_, entry)| entry)
@@ -3697,24 +3921,28 @@ async fn handle_place_array(
             let x = start_x + col as f64 * spacing_x;
             let y = start_y + row as f64 * spacing_y;
             let reference = format!("{prefix}{}", ref_start + planned.len() as u64);
-            let prepared = match prepare_footprint_source(
-                &source, &footprint, &reference, None, x, y, 0.0, "F.Cu",
+            let prepared = match PreparedFootprintPlacement::from_library(
+                &source,
+                &footprint,
+                &reference,
+                None,
+                x,
+                y,
+                0.0,
+                "F.Cu",
+                board.parent(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(CallToolResult::error(error.to_string())),
             };
-            let pads = match extract_pad_definitions(&prepared) {
-                Ok(pads) => pads,
-                Err(error) => return Ok(CallToolResult::error(error.to_string())),
-            };
-            planned.push((reference, pads, x, y));
+            planned.push((reference, prepared, x, y));
         }
     }
 
     let footprint_id = footprint.clone();
-    let placed = match with_board_ipc_classified(ctx, &board, move |c, _| {
+    let placed = match with_board_ipc_classified(ctx, &board, move |c, document| {
         let existing = c
-            .list_footprints()?
+            .list_footprints_in(document.clone())?
             .into_iter()
             .map(|footprint| footprint.reference)
             .collect::<HashSet<_>>();
@@ -3732,26 +3960,18 @@ async fn handle_place_array(
 
         let items = planned
             .iter()
-            .map(|(reference, pads, x, y)| {
-                KiCadIpcClient::build_footprint_item(
-                    &footprint_id,
-                    reference,
-                    &value,
-                    pads,
-                    &graphics,
-                    &fields,
-                    *x,
-                    *y,
-                    0.0,
-                    "F.Cu",
-                )
-                .with_context(|| format!("failed to prepare {reference}"))
+            .map(|(reference, prepared, x, y)| {
+                prepared
+                    .build_ipc_item(&footprint_id, reference, &value, *x, *y, 0.0, "F.Cu")
+                    .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        c.run_commit("Place footprint array", |c| c.create_items(items))?;
+        c.run_commit("Place footprint array", |c| {
+            c.create_items_in(document.clone(), items).map(|_| ())
+        })?;
 
         let mut created = c
-            .list_footprints()?
+            .list_footprints_in(document)?
             .into_iter()
             .map(|footprint| (footprint.reference.clone(), footprint))
             .collect::<HashMap<_, _>>();
@@ -3873,7 +4093,12 @@ async fn handle_duplicate_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let prepared = match prepare_footprint_source(
+    if let Some(reason) = typed_ipc_footprint_error(&source) {
+        return Ok(CallToolResult::error(format!(
+            "The footprint was not duplicated: KiCad 10 typed IPC cannot represent the complete library footprint: {reason}"
+        )));
+    }
+    let prepared = match PreparedFootprintPlacement::from_library(
         &source,
         &src.footprint,
         &new_reference,
@@ -3882,6 +4107,7 @@ async fn handle_duplicate_component(
         y,
         src.rotation,
         &src.layer,
+        board.parent(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
@@ -3891,24 +4117,14 @@ async fn handle_duplicate_component(
     let fp_value = src.value.clone();
     let fp_layer = src.layer.clone();
     let fp_rotation = src.rotation;
-    let pads = match extract_pad_definitions(&prepared) {
-        Ok(pads) => pads,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let graphics = match extract_graphic_definitions(&prepared) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&prepared);
     let dup_board = board.clone();
-    let fp = ipc!(ctx, args, |c| c.place_footprint(
+    let fp = ipc!(ctx, args, |c| place_prepared_footprint(
+        c,
         &dup_board,
+        &prepared,
         &fp_id,
         &ipc_reference,
         &fp_value,
-        &pads,
-        &graphics,
-        &fields,
         x,
         y,
         fp_rotation,
@@ -4177,6 +4393,320 @@ mod tests {
         assert_eq!(pads[0].number, "1");
         assert_eq!(pads[0].shape, "roundrect");
         assert_eq!(pads[0].layers, ["F.Cu", "F.Paste", "F.Mask"]);
+    }
+
+    #[test]
+    fn prepared_typed_item_preserves_stock_attributes_custom_fields_and_models() {
+        use konnect_ipc::gen::kiapi;
+
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        validate_typed_ipc_footprint_source(source).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("Capacitor_SMD.pretty");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(library.join("C_0603_1608Metric.kicad_mod"), source).unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Capacitor_SMD\") (type \"KiCad\") (uri \"${KIPRJMOD}/Capacitor_SMD.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let prepared = PreparedFootprintPlacement::from_library(
+            source,
+            "Capacitor_SMD:C_0603_1608Metric",
+            "C7",
+            Some("100n"),
+            12.0,
+            8.0,
+            90.0,
+            "F.Cu",
+            Some(temp.path()),
+        )
+        .unwrap();
+        let packed = prepared
+            .build_ipc_item(
+                "Capacitor_SMD:C_0603_1608Metric",
+                "C7",
+                "100n",
+                12.0,
+                8.0,
+                90.0,
+                "F.Cu",
+            )
+            .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        assert_eq!(
+            footprint.attributes.as_ref().unwrap().mounting_style(),
+            kiapi::board::types::FootprintMountingStyle::FmsSmd
+        );
+        assert_eq!(
+            footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str()),
+            Some("C7")
+        );
+        assert_eq!(
+            footprint
+                .value_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str()),
+            Some("100n")
+        );
+        let definition = footprint.definition.as_ref().unwrap();
+        assert!(definition
+            .attributes
+            .as_ref()
+            .unwrap()
+            .description
+            .starts_with("Capacitor SMD 0603"));
+        let custom = definition
+            .items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Field"))
+            .map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].name, "KiLib_Generator");
+        assert!(!custom[0].visible);
+        let models = definition
+            .items
+            .iter()
+            .filter(|item| {
+                konnect_ipc::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+            })
+            .count();
+        assert_eq!(models, 1);
+    }
+
+    #[test]
+    fn stock_ce_logo_unlocked_fields_map_to_typed_keep_upright() {
+        use konnect_ipc::gen::kiapi;
+
+        let path = std::path::Path::new(
+            "/opt/kicad/10.0.6/share/kicad/footprints/Symbol.pretty/CE-Logo_11.2x8mm_SilkScreen.kicad_mod",
+        );
+        let Ok(source) = std::fs::read_to_string(path) else {
+            eprintln!("SKIP: {} is not installed", path.display());
+            return;
+        };
+        validate_typed_ipc_footprint_source(&source)
+            .expect("stock CE logo fields are representable through typed IPC");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            format!(
+                "(fp_lib_table (lib (name \"Symbol\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\")))",
+                path.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let prepared = PreparedFootprintPlacement::from_library(
+            &source,
+            "Symbol:CE-Logo_11.2x8mm_SilkScreen",
+            "KLOGO1",
+            None,
+            20.0,
+            30.0,
+            0.0,
+            "F.Cu",
+            Some(temp.path()),
+        )
+        .unwrap();
+        let item = prepared
+            .build_ipc_item(
+                "Symbol:CE-Logo_11.2x8mm_SilkScreen",
+                "KLOGO1",
+                "CE-Logo_11.2x8mm_SilkScreen",
+                20.0,
+                30.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let keep_upright = |field: &Option<kiapi::board::types::Field>| {
+            field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.attributes.as_ref())
+                .map(|attributes| attributes.keep_upright)
+        };
+        assert_eq!(keep_upright(&footprint.reference_field), Some(true));
+        assert_eq!(keep_upright(&footprint.value_field), Some(true));
+        assert_eq!(keep_upright(&footprint.datasheet_field), Some(false));
+        assert_eq!(keep_upright(&footprint.description_field), Some(false));
+        assert_eq!(
+            footprint
+                .datasheet_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .map(|text| text.locked()),
+            Some(kiapi::common::types::LockedState::LsUnlocked)
+        );
+
+        let locked_source = source.replacen(
+            "\t\t(unlocked yes)\n\t\t(layer \"F.Fab\")",
+            "\t\t(unlocked yes)\n\t\t(locked yes)\n\t\t(layer \"F.Fab\")",
+            1,
+        );
+        let root = konnect_sexp::parse_sexp(&locked_source).unwrap();
+        let fields = super::super::pcb_footprint_update::parse_typed_library_fields(&root).unwrap();
+        let datasheet = fields
+            .iter()
+            .find(|field| field.name == "Datasheet")
+            .unwrap();
+        assert_eq!(
+            datasheet.text.as_ref().unwrap().locked(),
+            kiapi::common::types::LockedState::LsLocked
+        );
+    }
+
+    #[test]
+    fn visible_custom_property_is_one_field_not_a_duplicate_board_text() {
+        use konnect_ipc::gen::kiapi;
+
+        let source = r#"(footprint "Visible"
+          (version 20260206)
+          (generator pcbnew)
+          (layer "F.Cu")
+          (property "Reference" "REF**" (at 0 -1 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+          (property "Value" "Visible" (at 0 1 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+          (property "AssemblyVendor" "Example" (at 2 3 15) (layer "F.Fab") (effects (font (size 0.8 0.8) (thickness 0.12))))
+          (attr smd)
+          (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask" "F.Paste")))"#;
+        validate_typed_ipc_footprint_source(source).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(library.join("Visible.kicad_mod"), source).unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let prepared = PreparedFootprintPlacement::from_library(
+            source,
+            "Test:Visible",
+            "U1",
+            None,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+            Some(temp.path()),
+        )
+        .unwrap();
+        let packed = prepared
+            .build_ipc_item("Test:Visible", "U1", "Visible", 10.0, 20.0, 0.0, "F.Cu")
+            .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        let items = &footprint.definition.as_ref().unwrap().items;
+        let fields = items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Field"))
+            .map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "AssemblyVendor");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| {
+                    konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardText")
+                })
+                .count(),
+            0,
+            "the property must not also travel as anonymous graphic text"
+        );
+    }
+
+    #[test]
+    fn typed_source_validator_refuses_a_pad_clause_the_builder_would_drop() {
+        let source = FOOTPRINT.replace(
+            "(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")",
+            "(layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (solder_mask_margin 0.1)",
+        );
+        let error = validate_typed_ipc_footprint_source(&source).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("pad clause 'solder_mask_margin'"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stock_bga_pad_property_and_dip_point_remain_explicit_closed_path_requirements() {
+        for (path, expected) in [
+            (
+                "/opt/kicad/10.0.6/share/kicad/footprints/Package_BGA.pretty/BGA-100_11.0x11.0mm_Layout10x10_P1.0mm_Ball0.5mm_Pad0.4mm_NSMD.kicad_mod",
+                "pad clause 'property'",
+            ),
+            (
+                "/opt/kicad/10.0.6/share/kicad/footprints/Package_DIP.pretty/DIP-8_W7.62mm.kicad_mod",
+                "footprint child 'point'",
+            ),
+        ] {
+            let Ok(source) = std::fs::read_to_string(path) else {
+                eprintln!("SKIP: {path} is not installed");
+                continue;
+            };
+            let error = validate_typed_ipc_footprint_source(&source).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn typed_metadata_refusal_does_not_block_raw_closed_board_insertion() {
+        let source = r#"(footprint "RawOnly"
+          (version 20260206)
+          (generator pcbnew)
+          (layer "F.Cu")
+          (property "Reference" "REF**" (at 0 -1 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+          (property "Value" "RawOnly" (at 0 1 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+          (property "Vendor" "keep" (render_cache legacy) (at 2 3 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+          (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask" "F.Paste")))"#;
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(
+            library.join("RawOnly.kicad_mod"),
+            source.replace("\"keep\"", "\"changed-on-disk\""),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))\n").unwrap();
+        let prepared = PreparedFootprintPlacement::from_library(
+            source,
+            "Test:RawOnly",
+            "U9",
+            None,
+            4.0,
+            5.0,
+            0.0,
+            "F.Cu",
+            Some(temp.path()),
+        )
+        .expect("raw file preparation must not require typed metadata support");
+        assert!(prepared
+            .build_ipc_item("Test:RawOnly", "U9", "RawOnly", 4.0, 5.0, 0.0, "F.Cu")
+            .is_err());
+
+        prepared.insert_into_board(&board).unwrap();
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(property \"Vendor\" \"keep\" (render_cache legacy)"));
+        assert!(!written.contains("changed-on-disk"));
     }
 
     #[test]

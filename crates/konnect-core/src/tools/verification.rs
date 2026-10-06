@@ -3,12 +3,15 @@
 //! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{
     get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
-use konnect_sexp::writer::write_atomic;
+use anyhow::Context;
+use konnect_sexp::writer::{
+    apply_edits, find_direct_child_blocks, write_atomic, write_atomic_if_unchanged, SexpEdit,
+};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -995,19 +998,24 @@ async fn handle_copy_routing_pattern(
         let block = &content[block_start..block_end];
         if let Some((bx, by)) = extract_start_xy(block) {
             if bx >= src_x1 && bx <= src_x2 && by >= src_y1 && by <= src_y2 {
-                let translated = translate_block(block, dx, dy, &net_map);
+                let translated = translate_block(block, dx, dy, &net_map)?;
                 new_tracks.push(translated);
             }
         }
     }
 
     if new_tracks.is_empty() {
-        return Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "copied": 0,
-                "note": "No routing elements found in the specified source region"
-            }))
-            .unwrap(),
+        let reasons =
+            vec!["the source box contains no root-level segment or via routing item".to_string()];
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::PlanBlocked {
+                operation: "copy_routing_pattern".to_string(),
+                reasons: reasons.clone(),
+            },
+            format!(
+                "copy_routing_pattern copied nothing: {}",
+                reasons.join("; ")
+            ),
         ));
     }
 
@@ -1021,10 +1029,7 @@ async fn handle_copy_routing_pattern(
         &content[insert_pos..]
     );
 
-    // Assign new UUIDs to inserted blocks (replace uuid "ORIGINAL" with new ones)
-    let new_content = reassign_uuids(&new_content, insert_pos);
-
-    write_atomic(&board, &new_content)?;
+    write_atomic_if_unchanged(&board, &content, &new_content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1039,43 +1044,25 @@ async fn handle_copy_routing_pattern(
 /// Find all `(segment ...)` and `(via ...)` blocks in the PCB content.
 /// Returns (start, end, type) tuples.
 fn find_routing_blocks(content: &str) -> Vec<(usize, usize, &'static str)> {
-    let mut results = Vec::new();
-    for (prefix, kind) in &[("\n  (segment ", "segment"), ("\n  (via ", "via")] {
-        let mut pos = 0;
-        while let Some(found) = content[pos..].find(prefix) {
-            let start = pos + found + 3; // skip \n
-            let mut depth = 0i32;
-            let mut end = start;
-            for (i, ch) in content[start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            results.push((start, end, *kind));
-            pos = start + 1;
-        }
-    }
-    results
+    find_direct_child_blocks(content, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let root = konnect_sexp::parse_sexp(&content[start..end]).ok()?;
+            let kind = match root.head()? {
+                "segment" => "segment",
+                "via" => "via",
+                _ => return None,
+            };
+            Some((start, end, kind))
+        })
+        .collect()
 }
 
 /// Extract the `(start X Y)` coordinates from a routing block.
 fn extract_start_xy(block: &str) -> Option<(f64, f64)> {
-    let pat = "(start ";
-    let pos = block.find(pat)?;
-    let after = &block[pos + pat.len()..];
-    let end = after.find(')')?;
-    let parts: Vec<&str> = after[..end].split_whitespace().collect();
-    let x = parts.first()?.parse::<f64>().ok()?;
-    let y = parts.get(1)?.parse::<f64>().ok()?;
-    Some((x, y))
+    let root = konnect_sexp::parse_sexp(block).ok()?;
+    let point = root.find("start").or_else(|| root.find("at"))?;
+    Some((point.get_f64(1)?, point.get_f64(2)?))
 }
 
 /// Translate all coordinate pairs in a routing block by (dx, dy).
@@ -1084,78 +1071,66 @@ fn translate_block(
     dx: f64,
     dy: f64,
     net_map: &std::collections::HashMap<String, String>,
-) -> String {
-    let mut result = block.to_string();
-
-    // Translate (start X Y), (end X Y), (at X Y) coordinate pairs
-    for coord_key in &["start", "end", "at"] {
-        let pat = format!("({} ", coord_key);
-        let mut new_result = String::new();
-        let mut remaining = result.as_str();
-        while let Some(pos) = remaining.find(&pat) {
-            new_result.push_str(&remaining[..pos]);
-            new_result.push_str(&pat);
-            let after = &remaining[pos + pat.len()..];
-            if let Some(close) = after.find(')') {
-                let coords_str = &after[..close];
-                let parts: Vec<&str> = coords_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                        new_result.push_str(&format!("{} {}", x + dx, y + dy));
-                        if parts.len() > 2 {
-                            new_result.push(' ');
-                            new_result.push_str(&parts[2..].join(" "));
-                        }
-                        new_result.push(')');
-                        remaining = &remaining[pos + pat.len() + close + 1..];
-                        continue;
-                    }
-                }
-                // Fall through if parsing failed
-                new_result.push_str(coords_str);
-                new_result.push(')');
-                remaining = &remaining[pos + pat.len() + close + 1..];
+) -> anyhow::Result<String> {
+    let root = konnect_sexp::parse_sexp(block)?;
+    let parent = root.head().context("routing block has no tag")?;
+    if !matches!(parent, "segment" | "via") {
+        anyhow::bail!("expected a segment or via routing block");
+    }
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(block, parent) {
+        let child = konnect_sexp::parse_sexp(&block[start..end])?;
+        let Some(tag) = child.head() else {
+            continue;
+        };
+        if matches!(tag, "start" | "end" | "at") {
+            let x = child
+                .get_f64(1)
+                .context("routing coordinate X is invalid")?;
+            let y = child
+                .get_f64(2)
+                .context("routing coordinate Y is invalid")?;
+            let suffix = child
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(3)
+                .map(|atom| {
+                    atom.as_str()
+                        .map(str::to_string)
+                        .context("routing coordinate contains a nested value")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let suffix = if suffix.is_empty() {
+                String::new()
             } else {
-                break;
+                format!(" {}", suffix.join(" "))
+            };
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("({tag} {} {}{suffix})", x + dx, y + dy),
+            ));
+        } else if tag == "net" {
+            if let Some(old_net) = child.get(1).and_then(konnect_sexp::SexpNode::as_str) {
+                if let Some(new_net) = net_map.get(old_net) {
+                    let escaped = new_net.replace('\\', "\\\\").replace('"', "\\\"");
+                    edits.push(SexpEdit::replace(
+                        start,
+                        end,
+                        format!("(net \"{escaped}\")"),
+                    ));
+                }
             }
-        }
-        new_result.push_str(remaining);
-        result = new_result;
-    }
-
-    // Remap net names
-    for (old_net, new_net) in net_map {
-        let old_pat = format!("(net \"{}\")", old_net);
-        let new_pat = format!("(net \"{}\")", new_net);
-        result = result.replace(&old_pat, &new_pat);
-        // Also handle numeric net references if needed (not replaced here)
-    }
-
-    result
-}
-
-/// Reassign UUIDs in all newly inserted blocks (those after `insert_boundary`).
-fn reassign_uuids(content: &str, insert_boundary: usize) -> String {
-    let mut result = String::with_capacity(content.len() + 64);
-    result.push_str(&content[..insert_boundary]);
-    let tail = &content[insert_boundary..];
-    let mut remaining = tail;
-    while let Some(pos) = remaining.find("(uuid \"") {
-        result.push_str(&remaining[..pos]);
-        result.push_str("(uuid \"");
-        // Find end of UUID string
-        let after = &remaining[pos + 7..];
-        if let Some(end) = after.find('"') {
-            let new_uuid = uuid::Uuid::new_v4().to_string();
-            result.push_str(&new_uuid);
-            result.push('"');
-            remaining = &remaining[pos + 7 + end + 1..];
-        } else {
-            break;
+        } else if tag == "uuid" {
+            edits.push(SexpEdit::replace(
+                start,
+                end,
+                format!("(uuid \"{}\")", uuid::Uuid::new_v4()),
+            ));
         }
     }
-    result.push_str(remaining);
-    result
+    Ok(apply_edits(block.to_string(), edits))
 }
 
 // ─── Symbol info ──────────────────────────────────────────────────────────────
@@ -2143,5 +2118,159 @@ mod required_coordinate_tests {
                 "a refused copy must not touch the board"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_routing_parser_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    const KICAD_10_BOARD: &str =
+        include_str!("../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb");
+    const SELECTED_UUID: &str = "b1f4c0de-0000-4000-8000-00000000ad02";
+    const UNSELECTED_UUID: &str = "b1f4c0de-0000-4000-8000-00000000ad01";
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn text(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        serde_json::from_str(text).expect("structured result")
+    }
+
+    fn block_with_uuid<'a>(source: &'a str, uuid: &str) -> &'a str {
+        find_routing_blocks(source)
+            .into_iter()
+            .map(|(start, end, _)| &source[start..end])
+            .find(|block| block.contains(uuid))
+            .unwrap_or_else(|| panic!("routing block {uuid} not found"))
+    }
+
+    #[tokio::test]
+    async fn tab_indented_kicad10_segment_is_copied_with_new_unique_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        std::fs::write(&board, KICAD_10_BOARD).unwrap();
+        let source_selected = block_with_uuid(KICAD_10_BOARD, SELECTED_UUID).to_string();
+        let source_unselected = block_with_uuid(KICAD_10_BOARD, UNSELECTED_UUID).to_string();
+
+        let result = handle_copy_routing_pattern(
+            &json!({
+                "board": board,
+                "src_x1": 70.0, "src_y1": 70.0,
+                "src_x2": 130.0, "src_y2": 90.0,
+                "dest_x": 70.0, "dest_y": 100.0,
+                "net_map": {}
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(text(&result)["copied"], 1);
+        let after = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(block_with_uuid(&after, SELECTED_UUID), source_selected);
+        assert_eq!(block_with_uuid(&after, UNSELECTED_UUID), source_unselected);
+        let root = konnect_sexp::parse_sexp(&after).unwrap();
+        let uuids = root
+            .find_all("uuid")
+            .into_iter()
+            .filter_map(|node| node.get(1).and_then(konnect_sexp::SexpNode::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(uuids.len(), uuids.iter().collect::<HashSet<_>>().len());
+        let copied = find_routing_blocks(&after)
+            .into_iter()
+            .map(|(start, end, _)| &after[start..end])
+            .find(|block| block.contains("(start 80 110)") && block.contains("(end 120 110)"))
+            .expect("translated segment");
+        assert!(!copied.contains(SELECTED_UUID));
+    }
+
+    #[tokio::test]
+    async fn empty_source_box_is_a_typed_refusal_and_preserves_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        std::fs::write(&board, KICAD_10_BOARD).unwrap();
+        let before = std::fs::read(&board).unwrap();
+
+        let result = handle_copy_routing_pattern(
+            &json!({
+                "board": board,
+                "src_x1": 0.0, "src_y1": 0.0,
+                "src_x2": 1.0, "src_y2": 1.0,
+                "dest_x": 10.0, "dest_y": 10.0
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(text(&result)["error"]["kind"], "plan_blocked");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[test]
+    fn strings_and_nested_items_are_not_root_routing_blocks() {
+        let close = KICAD_10_BOARD.rfind(')').unwrap();
+        let mut source = KICAD_10_BOARD.to_string();
+        source.insert_str(
+            close,
+            "\n\t(gr_text \"(segment (start 80 80) (end 120 80))\" (at 0 0) (layer \"F.SilkS\"))\n\t(footprint \"Nested\" (layer \"F.Cu\") (segment (start 80 80) (end 120 80)))\n",
+        );
+        assert_eq!(find_routing_blocks(&source).len(), 2);
+    }
+
+    /// Actual parser/export acceptance for the written result:
+    ///
+    ///     KICAD_CLI=/usr/local/bin/kicad-cli cargo test -p konnect-core --locked \
+    ///       --lib copy_routing_live_kicad_roundtrip -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a real KiCad 10 kicad-cli"]
+    async fn copy_routing_live_kicad_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        std::fs::write(&board, KICAD_10_BOARD).unwrap();
+        let result = handle_copy_routing_pattern(
+            &json!({
+                "board": board,
+                "src_x1": 70.0, "src_y1": 70.0,
+                "src_x2": 130.0, "src_y2": 90.0,
+                "dest_x": 70.0, "dest_y": 100.0
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        crate::tools::cli::run_drc(&cli, &board, false)
+            .await
+            .expect("KiCad must load the copied routing for DRC");
+        let netlist = dir.path().join("routing.d356");
+        crate::tools::cli::export_ipcd356(&cli, &board, &netlist)
+            .await
+            .expect("KiCad must load the copied routing for export");
+        assert!(netlist.is_file() && netlist.metadata().unwrap().len() > 0);
     }
 }

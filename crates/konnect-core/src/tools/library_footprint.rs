@@ -11,6 +11,52 @@ use anyhow::{bail, Context, Result};
 use konnect_ipc::gen::kiapi;
 use konnect_sexp::SexpNode;
 
+/// Refuse library children that KiCad 10 cannot carry through the typed PCB
+/// IPC footprint messages.
+///
+/// A library file may contain more kinds than `Footprint.items` can expose.
+/// In particular, KiCad parses `(point ...)` into `PCB_POINT`, but neither
+/// `Footprint::Serialize` nor the `GraphicShape` protobuf has a point variant.
+/// Reconstructing a footprint from the typed response would therefore erase
+/// the child without giving the caller any warning.  Typed placement and sync
+/// paths call this before building an IPC item; the closed-board S-expression
+/// path deliberately does not, because it forwards the complete object graph.
+pub(crate) fn validate_typed_ipc_direct_children(root: &SexpNode) -> Result<()> {
+    if root.head() != Some("footprint") {
+        bail!("library source root must be a footprint");
+    }
+
+    for child in root.children().unwrap_or_default().iter().skip(2) {
+        let tag = child
+            .head()
+            .context("footprint contains a direct child atom that typed IPC cannot represent")?;
+        if !matches!(
+            tag,
+            "version"
+                | "generator"
+                | "generator_version"
+                | "layer"
+                | "descr"
+                | "tags"
+                | "property"
+                | "attr"
+                | "duplicate_pad_numbers_are_jumpers"
+                | "embedded_fonts"
+                | "fp_text"
+                | "fp_line"
+                | "fp_rect"
+                | "fp_circle"
+                | "fp_arc"
+                | "fp_poly"
+                | "pad"
+                | "model"
+        ) {
+            bail!("footprint child '{tag}' has no lossless KiCad 10 typed IPC representation");
+        }
+    }
+    Ok(())
+}
+
 /// The instance attributes a library footprint's `(attr …)` declares.
 ///
 /// A footprint with no `(attr …)` gets KiCad's default: no mounting style,
@@ -146,6 +192,26 @@ mod tests {
 
     fn root(source: &str) -> SexpNode {
         konnect_sexp::parse_sexp(source).unwrap()
+    }
+
+    #[test]
+    fn typed_ipc_preflight_names_an_unrepresentable_point() {
+        let source = r#"(footprint "LED_D5.0mm"
+            (layer "F.Cu")
+            (pad "1" thru_hole rect (at 0 0) (size 1.8 1.8) (drill 0.9) (layers "*.Cu" "*.Mask"))
+            (point (at 1.27 0) (size 2) (layer "F.Fab")))"#;
+        let error = validate_typed_ipc_direct_children(&root(source)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "footprint child 'point' has no lossless KiCad 10 typed IPC representation"
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn typed_ipc_preflight_accepts_the_current_typed_child_surface() {
+        validate_typed_ipc_direct_children(&root(C_0603)).unwrap();
     }
 
     /// The KiCad-written 0603 capacitor: `(attr smd)`, its description and
